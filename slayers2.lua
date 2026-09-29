@@ -1138,8 +1138,6 @@ end
 ----------------------------------------------------------------------
 -- EXAMPLE: delete everything below this line when making your own UI
 ----------------------------------------------------------------------
-
--- The hub itself. It only runs once the key below has been accepted.
 local function loadHub()
 	local window = UILib.new({
 		Title = "cat's universal hub",
