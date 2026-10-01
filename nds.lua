@@ -1334,6 +1334,7 @@ local function loadHub()
 		Sprint = Enum.KeyCode.R,
 		SavePlayer = Enum.KeyCode.T,
 		Fling = Enum.KeyCode.Z,
+		Forcefield = Enum.KeyCode.X,
 		Forward = Enum.KeyCode.W,
 		Back = Enum.KeyCode.S,
 		Left = Enum.KeyCode.A,
@@ -1830,6 +1831,7 @@ local function loadHub()
 
 	-- handles filled in further down; Chillax mode drives them
 	local waterToggle, antiFlingToggle, gloomToggle, antiQuakeToggle, chillaxToggle
+	local shootingStarsToggle, blueMeteorsToggle, forcefieldToggle, dodgeMeteorToggle, uiThemeToggle
 	local function setChillax(on)
 		if waterToggle then
 			waterToggle:Set(on)
@@ -1843,6 +1845,18 @@ local function loadHub()
 		if antiQuakeToggle then
 			antiQuakeToggle:Set(on)
 		end
+		if shootingStarsToggle then
+			shootingStarsToggle:Set(on)
+		end
+		if blueMeteorsToggle then
+			blueMeteorsToggle:Set(on)
+		end
+		if dodgeMeteorToggle then
+			dodgeMeteorToggle:Set(on)
+		end
+		if uiThemeToggle then
+			uiThemeToggle:Set(on)
+		end
 	end
 
 	main:AddSection("Modes")
@@ -1855,7 +1869,7 @@ local function loadHub()
 			saveKeys()
 		end,
 	})
-	main:AddLabel("Turns the water platform, anti fling, anti earthquake and gloomy night on together, and off again when you switch it off. Off by default; if you turn it on it stays on next time.")
+	main:AddLabel("Turns the water platform, anti fling, anti earthquake, gloomy night, shooting stars, blue meteors, dodge meteor, and magenta UI theme on together, and off again when you switch it off. Off by default; if you turn it on it stays on next time.")
 
 	----------------------------------------------------------------------
 	-- Save player: while the toggle is on, whoever is under your aim (the mouse,
@@ -3073,14 +3087,301 @@ local function loadHub()
 	end
 
 	----------------------------------------------------------------------
+	-- Debris forcefield: an invisible sphere around you. Any loose (unanchored)
+	-- piece that gets inside it is pushed away from you. Pieces are claimed the
+	-- same way as in Super Ring Parts (huge simulation radius + replication focus),
+	-- so the push actually sticks. Characters and humanoid models are never touched.
+	-- While a piece is inside the sphere it doesn't collide, so it can't hit you on
+	-- the way out; its collision is restored as soon as it leaves (or when switched off).
+	----------------------------------------------------------------------
+	do
+		local LocalPlayer = Players.LocalPlayer
+		local shieldOn = false
+		local shieldConn = nil
+		local shieldRadius = 30
+		local shieldStrength = 80
+		local LIFT = 0.25 -- upward bias so pushed pieces don't scrape along the ground
+		local SHOVE_MULT = 8 -- extra push right next to you, as a multiple of the strength slider
+		local MAX_SPEED = 800 -- studs/s ceiling for any push
+		local CLAIM_EXTRA = 60 -- pieces up to this far beyond the sphere are kept claimed too
+		local RETAIN_NUDGE = 0.002 -- studs/s, far too small to move anything; just keeps ownership
+		local LOOKAHEAD = 0.12 -- seconds; pieces heading at you are treated as this much closer
+		local nudgeSign = 1
+		local HIGH_VEL = 20 -- studs/s; only pieces moving at least this fast lose collision (any speed during an earthquake)
+		local HIGH_VEL_EXIT = 10 -- once non-solid, a piece stays non-solid until it slows below this (stops flicker at the threshold)
+		local fastAsm = {} -- [assembly root] = true while it is non-solid because of its speed
+		local changed = {} -- [part] = original CanCollide
+		local origFocus = nil
+		local haveOrigFocus = false
+
+		local overlap = OverlapParams.new()
+		overlap.FilterType = Enum.RaycastFilterType.Exclude
+
+		-- finds what you're standing on, so that is never made non-solid or pushed
+		local floorParams = RaycastParams.new()
+		floorParams.FilterType = Enum.RaycastFilterType.Exclude
+		floorParams.RespectCanCollide = true
+
+		local function restoreCollide(part)
+			local orig = changed[part]
+			changed[part] = nil
+			if orig ~= nil and part.Parent then
+				part.CanCollide = orig
+			end
+		end
+
+		local function quakeNow()
+			return type(currentDisaster) == "string" and string.find(string.lower(currentDisaster), "earthquake", 1, true) ~= nil
+		end
+
+		local function claimParts()
+			pcall(function()
+				if type(sethiddenproperty) == "function" then
+					sethiddenproperty(LocalPlayer, "SimulationRadius", math.huge)
+				end
+				LocalPlayer.MaximumSimulationRadius = math.huge
+			end)
+		end
+
+		local frame = 0
+		local asmCache = {} -- [assembly root] = { parts = {...}, frame = n } so connected parts aren't re-queried every frame
+
+		-- can we actually move this piece? velocity only sticks on pieces your client simulates
+		local hasOwnerCheck = type(isnetworkowner) == "function"
+		local function owns(asm)
+			if not hasOwnerCheck then
+				return true
+			end
+			local ok, res = pcall(isnetworkowner, asm)
+			return not ok or res
+		end
+
+		local function step()
+			claimParts()
+			frame = frame + 1
+
+			local char = LocalPlayer.Character
+			local root = char and char:FindFirstChild("HumanoidRootPart")
+			local insideParts = {}
+			local insideAsm = {}
+			local nowFast = {}
+			local quake = quakeNow()
+
+			if root then
+				-- never touch any player's character
+				local exclude = {}
+				for _, plr in ipairs(Players:GetPlayers()) do
+					if plr.Character then
+						table.insert(exclude, plr.Character)
+					end
+				end
+				overlap.FilterDescendantsInstances = exclude
+
+				local center = root.Position
+
+				-- assemblies that must never be touched: your own, and the one under your feet
+				local myAssembly = root.AssemblyRootPart
+				local floorAssembly = nil
+				floorParams.FilterDescendantsInstances = { char }
+				local floorHit = workspace:Raycast(center, Vector3.new(0, -10, 0), floorParams)
+				if floorHit and floorHit.Instance then
+					floorAssembly = floorHit.Instance.AssemblyRootPart
+				end
+
+				-- 1) group nearby parts by the piece (assembly) they belong to. Distance is measured
+				-- to the nearest point of each part's box, not its center, so big pieces count when
+				-- any part of them is inside the sphere.
+				local groups = {}
+				for _, part in ipairs(workspace:GetPartBoundsInRadius(center, shieldRadius + CLAIM_EXTRA, overlap)) do
+					local asm = part.AssemblyRootPart
+					if asm and not part.Anchored and not asm.Anchored and asm ~= myAssembly and asm ~= floorAssembly then
+						local g = groups[asm]
+						if g == nil then
+							g = { dist = math.huge, dir = Vector3.yAxis, bad = false }
+							groups[asm] = g
+						end
+						if not g.bad then
+							local model = part:FindFirstAncestorOfClass("Model")
+							if model and model:FindFirstChildOfClass("Humanoid") then
+								g.bad = true
+							else
+								local cf = part.CFrame
+								local half = part.Size * 0.5
+								local lp = cf:PointToObjectSpace(center)
+								local nearest = cf:PointToWorldSpace(Vector3.new(
+									math.clamp(lp.X, -half.X, half.X),
+									math.clamp(lp.Y, -half.Y, half.Y),
+									math.clamp(lp.Z, -half.Z, half.Z)
+								))
+								local offset = nearest - center
+								local d = offset.Magnitude
+								if d < g.dist then
+									g.dist = d
+									if d > 0.01 then
+										g.dir = offset / d
+									else
+										local o2 = part.Position - center
+										g.dir = o2.Magnitude > 0.01 and o2.Unit or Vector3.yAxis
+									end
+								end
+							end
+						end
+					end
+				end
+
+				-- 2) handle each piece once, as a whole
+				-- flips every frame so the nudges cancel out and never add up to a drift
+				nudgeSign = -nudgeSign
+				local nudge = Vector3.new(RETAIN_NUDGE * nudgeSign, 0, RETAIN_NUDGE * nudgeSign)
+				for asm, g in pairs(groups) do
+					if not g.bad then
+						local vel = asm.AssemblyLinearVelocity
+						-- a piece rushing toward you counts as closer, so fast debris is pushed earlier
+						local closing = math.max(0, -vel:Dot(g.dir))
+						local eff = g.dist - closing * LOOKAHEAD
+						if eff <= shieldRadius then
+							-- only fast pieces (>= HIGH_VEL studs/s) stop colliding, so slow or resting
+							-- pieces can't sink through the floor. During an earthquake every piece
+							-- inside the sphere is non-solid, as the shaking makes speed unreliable.
+							local limit = fastAsm[asm] and HIGH_VEL_EXIT or HIGH_VEL
+							if quake or vel.Magnitude >= limit then
+								nowFast[asm] = true
+								insideAsm[asm] = true
+
+								-- every part of the piece stops colliding, not just the ones in range
+								local c = asmCache[asm]
+								if c == nil or frame - c.frame >= 20 then
+									local ok, list = pcall(asm.GetConnectedParts, asm, true)
+									c = { parts = ok and list or { asm }, frame = frame }
+									asmCache[asm] = c
+								end
+								for _, p in ipairs(c.parts) do
+									if changed[p] == nil then
+										changed[p] = p.CanCollide
+									end
+									if p.CanCollide then
+										p.CanCollide = false
+									end
+									insideParts[p] = true
+								end
+							end
+
+							-- one push for the whole piece, only if we simulate it (otherwise it
+							-- wouldn't stick anyway; it still can't collide with you locally)
+							if owns(asm) then
+								local dir = (g.dir + Vector3.new(0, LIFT, 0)).Unit
+								local d = math.max(eff, 0)
+								-- gentle nudge at the edge (25% of the strength) up to full strength at your feet...
+								local t = 1 - math.clamp(d / shieldRadius, 0, 1)
+								local speed = shieldStrength * (0.25 + 0.75 * t * t)
+								-- ...plus a huge shove that ramps in smoothly when a piece is really close
+								local core = math.max(4, shieldRadius * 0.25)
+								local cc = math.clamp((core - d) / core, 0, 1)
+								speed = math.min(speed + shieldStrength * SHOVE_MULT * cc * cc, MAX_SPEED)
+								asm.AssemblyLinearVelocity = dir * speed
+							end
+						elseif g.dist <= shieldRadius + CLAIM_EXTRA then
+							-- outside the sphere: leave it alone physically, just keep it claimed
+							if owns(asm) then
+								asm.AssemblyLinearVelocity = vel + nudge
+							end
+						end
+					end
+				end
+			end
+
+			fastAsm = nowFast
+
+			-- pieces that left the sphere, slowed down (or vanished) get their collision back
+			for part in pairs(changed) do
+				if not insideParts[part] then
+					restoreCollide(part)
+				end
+			end
+			for asm in pairs(asmCache) do
+				if not insideAsm[asm] then
+					asmCache[asm] = nil
+				end
+			end
+		end
+
+		local function setShield(on)
+			if on == shieldOn then
+				return
+			end
+			shieldOn = on
+			if shieldConn then
+				shieldConn:Disconnect()
+				shieldConn = nil
+			end
+			if on then
+				pcall(function()
+					origFocus = LocalPlayer.ReplicationFocus
+					haveOrigFocus = true
+					LocalPlayer.ReplicationFocus = workspace
+				end)
+				-- PreSimulation runs BEFORE the physics step, so the push applies this frame, not the next
+				local okSig, preSim = pcall(function()
+					return RunService.PreSimulation
+				end)
+				shieldConn = (okSig and preSim or RunService.Stepped):Connect(step)
+			else
+				for part in pairs(changed) do
+					restoreCollide(part)
+				end
+				if haveOrigFocus then
+					pcall(function()
+						LocalPlayer.ReplicationFocus = origFocus
+					end)
+					haveOrigFocus = false
+				end
+			end
+		end
+
+		-- toggles the forcefield with its key (set in Settings, default X)
+		local shieldKeyConn = UserInputService.InputBegan:Connect(function(input, processed)
+			if not processed and not window._listening and Keys.Forcefield and input.KeyCode == Keys.Forcefield and forcefieldToggle then
+				forcefieldToggle:Set(not forcefieldToggle:Get())
+			end
+		end)
+
+		window.Gui.Destroying:Connect(function()
+			shieldKeyConn:Disconnect()
+			setShield(false)
+		end)
+
+		disasters:AddSection("Debris forcefield")
+		forcefieldToggle = disasters:AddToggle({
+			Text = "Debris forcefield",
+			Default = false,
+			Callback = setShield,
+		})
+		disasters:AddSlider({
+			Text = "Forcefield radius",
+			Min = 5, Max = 300, Default = 100, Step = 1, Suffix = " studs",
+			Callback = function(v)
+				shieldRadius = v
+			end,
+		})
+		disasters:AddSlider({
+			Text = "Push strength",
+			Min = 20, Max = 250, Default = 80, Step = 5, Suffix = " st/s",
+			Callback = function(v)
+				shieldStrength = v
+			end,
+		})
+		disasters:AddLabel("Invisible sphere that pushes debris away from you. Pieces you don't own are made non-solid. Press X to toggle. Not part of Chillax mode.")
+	end
+
+	----------------------------------------------------------------------
 	-- Dodge Meteor. Every meteor in workspace.Structure.MeteorFolder is
 	-- tracked and its flight is simulated forward as a curved (ballistic)
 	-- path: position + velocity + acceleration. Acceleration starts at
 	-- workspace.Gravity and is corrected from the meteor's real velocity
 	-- changes. The path is walked in short segments and each segment is
 	-- raycast, so the first thing the curve touches is the predicted landing
-	-- point. A red pillar (no collision, not touchable, not hit by raycasts)
-	-- stands on every predicted landing point. If you are within DANGER_RADIUS
+	-- point. A small flat red disc (no collision, not touchable, not hit by raycasts)
+	-- lies on every predicted landing point. If you are within DANGER_RADIUS
 	-- studs of a predicted impact you are moved to a clear spot further away.
 	----------------------------------------------------------------------
 	do
@@ -3090,8 +3391,8 @@ local function loadHub()
 		local MIN_SPEED = 2 -- slower than this and the meteor counts as stopped / landed
 		local SAMPLE_TIME = 0.1 -- seconds between velocity samples (used to learn acceleration)
 		local ACCEL_SMOOTH = 0.3 -- 0..1, how fast the learned acceleration follows new samples
-		local PILLAR_HEIGHT = 40
-		local PILLAR_WIDTH = 2
+		local PILLAR_HEIGHT = 1 -- thickness of the marker disc
+		local PILLAR_WIDTH = 3 -- diameter of the marker disc
 		local PILLAR_COLOR = Color3.fromRGB(255, 70, 70)
 		local DANGER_RADIUS = 30 -- closer than this to a predicted impact = move away
 		local SAFE_DISTANCE = 35 -- where you get put, measured from the impact (a margin past DANGER_RADIUS)
@@ -3128,7 +3429,10 @@ local function loadHub()
 		local function makePillar()
 			return new("Part", {
 				Name = "MeteorPillar",
-				Size = Vector3.new(PILLAR_WIDTH, PILLAR_HEIGHT, PILLAR_WIDTH),
+				Shape = Enum.PartType.Cylinder,
+				-- a cylinder's axis runs along X, so X is the thickness; rotated to lie flat
+				Size = Vector3.new(PILLAR_HEIGHT, PILLAR_WIDTH, PILLAR_WIDTH),
+				Orientation = Vector3.new(0, 0, 90),
 				Color = PILLAR_COLOR,
 				Material = Enum.Material.Neon,
 				Transparency = 0.35,
@@ -3374,12 +3678,12 @@ local function loadHub()
 		end)
 
 		disasters:AddSection("Meteors")
-		disasters:AddToggle({
+		dodgeMeteorToggle = disasters:AddToggle({
 			Text = "Dodge Meteor",
 			Default = false,
 			Callback = setDodgeMeteor,
 		})
-		disasters:AddLabel("Tracks every meteor in workspace.Structure.MeteorFolder, simulates its curved flight and stands a red pillar (no collision) on each predicted landing spot. If you end up within 30 studs of a predicted impact you are moved to a clear spot 35 studs away.")
+		disasters:AddLabel("Tracks every meteor in workspace.Structure.MeteorFolder, simulates its curved flight and lays a small flat red disc (no collision) on each predicted landing spot. If you end up within 30 studs of a predicted impact you are moved to a clear spot 35 studs away. Switches on with Chillax mode.")
 	end
 
 	----------------------------------------------------------------------
@@ -3679,6 +3983,18 @@ local function loadHub()
 		local gloomConn = nil
 		local entries = {} -- { inst, orig = {prop=value}, target = {prop=value}, created = bool }
 
+		-- custom night skybox (applied to the map's Sky, or to our own if the map has none)
+		local SKY_FACES = {
+			SkyboxBk = "rbxassetid://154185004",
+			SkyboxDn = "rbxassetid://154184960",
+			SkyboxFt = "rbxassetid://154185021",
+			SkyboxLf = "rbxassetid://154184943",
+			SkyboxRt = "rbxassetid://154184972",
+			SkyboxUp = "rbxassetid://154185031",
+		}
+		local skyInst = nil
+		local skyOrig = nil -- original face ids, restored when gloomy night is switched off
+
 		local function mix(a, b, t)
 			if typeof(a) == "Color3" then
 				return a:Lerp(b, t)
@@ -3744,6 +4060,11 @@ local function loadHub()
 
 			-- stars (the real moon is hidden; a custom one is drawn below)
 			ensure("Sky", Lighting, { StarCount = 0, MoonAngularSize = 11 }, { StarCount = 2500, MoonAngularSize = 0 }, true)
+			skyInst = entries[#entries].inst
+			skyOrig = {}
+			for face in pairs(SKY_FACES) do
+				skyOrig[face] = skyInst[face]
+			end
 
 			-- heavy, dusky clouds, only if the map has them
 			local clouds = terrain and terrain:FindFirstChildOfClass("Clouds")
@@ -3768,6 +4089,15 @@ local function loadHub()
 		end
 
 		local function apply()
+			-- skybox: swap faces in/out with the slider (strings can't be blended)
+			if skyInst and skyInst.Parent then
+				for face, id in pairs(SKY_FACES) do
+					local want = gloomAmount >= 0.5 and id or skyOrig[face]
+					if skyInst[face] ~= want then
+						skyInst[face] = want
+					end
+				end
+			end
 			for _, e in ipairs(entries) do
 				if e.inst.Parent then
 					for prop, target in pairs(e.target) do
@@ -4031,6 +4361,14 @@ local function loadHub()
 					gloomConn = nil
 				end
 				destroyMoon()
+				if skyInst and skyInst.Parent and skyOrig then
+					for face, v in pairs(skyOrig) do
+						pcall(function()
+							skyInst[face] = v
+						end)
+					end
+				end
+				skyInst, skyOrig = nil, nil
 				for _, e in ipairs(entries) do
 					if e.created then
 						e.inst:Destroy()
@@ -4051,6 +4389,253 @@ local function loadHub()
 			noFogOn, noCloudsOn, removeGuiOn = false, false, false
 			setGloom(false)
 			refreshWorld()
+		end)
+
+		----------------------------------------------------------------------
+		-- Shooting stars: only spawn where you can see them (inside the camera view,
+		-- above the horizon, line of sight clear, whole path on screen)
+		----------------------------------------------------------------------
+		local STAR = {
+			MinDelay = 0.6, MaxDelay = 3, SkyDistance = 600, Size = 3.5, Width = 5,
+			TrailLifetime = 0.8, MinTravel = 200, MaxTravel = 400, MinElevation = 10,
+			ViewFraction = 0.75, MaxAttempts = 12,
+		}
+		local STAR_RED = Color3.fromRGB(255, 70, 70)
+		local STAR_WHITE = Color3.fromRGB(255, 255, 255)
+		local STAR_BLUE = Color3.fromRGB(150, 205, 255)
+		local starFolder = nil
+		local starToken = 0
+
+		local function randomStarColor()
+			local t = math.random()
+			if t < 0.5 then
+				return STAR_RED:Lerp(STAR_WHITE, t * 2)
+			end
+			return STAR_WHITE:Lerp(STAR_BLUE, (t - 0.5) * 2)
+		end
+
+		local function randomRange(limit)
+			return (math.random() * 2 - 1) * limit
+		end
+
+		local function findVisiblePath(cam)
+			local viewport = cam.ViewportSize
+			if viewport.Y <= 0 then
+				return nil
+			end
+			local vHalf = math.rad(cam.FieldOfView / 2)
+			local hHalf = math.atan(math.tan(vHalf) * (viewport.X / viewport.Y))
+			local minY = math.sin(math.rad(STAR.MinElevation))
+
+			local rayParams = RaycastParams.new()
+			rayParams.FilterType = Enum.RaycastFilterType.Exclude
+			local exclude = { starFolder }
+			local character = Players.LocalPlayer and Players.LocalPlayer.Character
+			if character then
+				table.insert(exclude, character)
+			end
+			rayParams.FilterDescendantsInstances = exclude
+
+			local camPos = cam.CFrame.Position
+			for _ = 1, STAR.MaxAttempts do
+				local frame = cam.CFrame * CFrame.Angles(
+					randomRange(vHalf * STAR.ViewFraction),
+					randomRange(hHalf * STAR.ViewFraction),
+					0
+				)
+				local dir = frame.LookVector
+				if dir.Y >= minY then
+					local startPos = camPos + dir * STAR.SkyDistance
+					local sign = math.random() < 0.5 and 1 or -1
+					local travelDir = (frame.RightVector * sign + Vector3.new(0, -0.4, 0)).Unit
+					local endPos = startPos + travelDir * math.random(STAR.MinTravel, STAR.MaxTravel)
+					local _, startOnScreen = cam:WorldToViewportPoint(startPos)
+					local _, endOnScreen = cam:WorldToViewportPoint(endPos)
+					if startOnScreen and endOnScreen then
+						if not workspace:Raycast(camPos, startPos - camPos, rayParams) then
+							return startPos, endPos
+						end
+					end
+				end
+			end
+			return nil
+		end
+
+		local function spawnStar()
+			local cam = workspace.CurrentCamera
+			if not (cam and starFolder) then
+				return
+			end
+			local startPos, endPos = findVisiblePath(cam)
+			if not startPos then
+				return
+			end
+
+			local duration = math.random(8, 14) / 10
+			local color = randomStarColor()
+
+			local star = Instance.new("Part")
+			star.Shape = Enum.PartType.Ball
+			star.Size = Vector3.new(STAR.Size, STAR.Size, STAR.Size)
+			star.Material = Enum.Material.Neon
+			star.Color = color
+			star.Anchored = true
+			star.CanCollide = false
+			star.CanQuery = false
+			star.CanTouch = false
+			star.CastShadow = false
+			star.Position = startPos
+
+			local a0 = Instance.new("Attachment")
+			a0.Position = Vector3.new(0, STAR.Width / 2, 0)
+			a0.Parent = star
+			local a1 = Instance.new("Attachment")
+			a1.Position = Vector3.new(0, -STAR.Width / 2, 0)
+			a1.Parent = star
+
+			local trail = Instance.new("Trail")
+			trail.Attachment0 = a0
+			trail.Attachment1 = a1
+			trail.Color = ColorSequence.new(color)
+			trail.Transparency = NumberSequence.new({
+				NumberSequenceKeypoint.new(0, 0),
+				NumberSequenceKeypoint.new(1, 1),
+			})
+			trail.LightEmission = 1
+			trail.FaceCamera = true
+			trail.Lifetime = STAR.TrailLifetime
+			trail.Parent = star
+
+			star.Parent = starFolder
+			TweenService:Create(star, TweenInfo.new(duration, Enum.EasingStyle.Linear), {
+				Position = endPos,
+			}):Play()
+			task.delay(duration + STAR.TrailLifetime, function()
+				star:Destroy()
+			end)
+		end
+
+		local function setShootingStars(on)
+			starToken += 1
+			if starFolder then
+				starFolder:Destroy()
+				starFolder = nil
+			end
+			if not on then
+				return
+			end
+			local token = starToken
+			starFolder = Instance.new("Folder")
+			starFolder.Name = "ShootingStars"
+			starFolder.Parent = workspace
+			task.spawn(function()
+				while starToken == token do
+					task.wait(STAR.MinDelay + math.random() * (STAR.MaxDelay - STAR.MinDelay))
+					if starToken ~= token then
+						break
+					end
+					spawnStar()
+				end
+			end)
+		end
+
+		----------------------------------------------------------------------
+		-- Blue meteors: shrinks each meteor and turns its fire/smoke blue
+		-- (workspace.Structure.MeteorFolder); everything is put back when off
+		----------------------------------------------------------------------
+		local METEOR_SIZE = Vector3.new(1, 1, 1)
+		local METEOR_FIRE = ColorSequence.new(Color3.fromRGB(0, 140, 255))
+		local METEOR_SMOKE = ColorSequence.new(Color3.fromRGB(110, 170, 255))
+		local meteorToken = 0
+		local meteorEntries = {} -- [part] = { size, conn, fire, fireColor, smoke, smokeColor }
+
+		local function getMeteorFolder()
+			local structure = workspace:FindFirstChild("Structure")
+			return structure and structure:FindFirstChild("MeteorFolder")
+		end
+
+		local function tweakMeteor(meteor, token)
+			if not meteor:IsA("BasePart") or meteorEntries[meteor] then
+				return
+			end
+			local entry = { size = meteor.Size }
+			meteorEntries[meteor] = entry
+
+			local function lock()
+				if meteor.Size ~= METEOR_SIZE then
+					meteor.Size = METEOR_SIZE
+				end
+			end
+			lock()
+			entry.conn = meteor:GetPropertyChangedSignal("Size"):Connect(lock)
+
+			-- children can replicate after the part
+			task.spawn(function()
+				local fire = meteor:WaitForChild("Fire", 5)
+				if meteorToken == token and fire and fire:IsA("ParticleEmitter") then
+					entry.fire, entry.fireColor = fire, fire.Color
+					fire.Color = METEOR_FIRE
+				end
+				local smoke = meteor:WaitForChild("Smoke", 5)
+				if meteorToken == token and smoke and smoke:IsA("ParticleEmitter") then
+					entry.smoke, entry.smokeColor = smoke, smoke.Color
+					smoke.Color = METEOR_SMOKE
+				end
+			end)
+		end
+
+		local function restoreMeteors()
+			for part, e in pairs(meteorEntries) do
+				if e.conn then
+					e.conn:Disconnect()
+				end
+				if part.Parent then
+					part.Size = e.size
+				end
+				if e.fire and e.fire.Parent then
+					e.fire.Color = e.fireColor
+				end
+				if e.smoke and e.smoke.Parent then
+					e.smoke.Color = e.smokeColor
+				end
+			end
+			table.clear(meteorEntries)
+		end
+
+		local function setBlueMeteors(on)
+			meteorToken += 1
+			restoreMeteors()
+			if not on then
+				return
+			end
+			local token = meteorToken
+			task.spawn(function()
+				while meteorToken == token do
+					local folder = getMeteorFolder()
+					while not folder and meteorToken == token do
+						task.wait(0.25)
+						folder = getMeteorFolder()
+					end
+					if meteorToken ~= token then
+						return
+					end
+					for _, child in ipairs(folder:GetChildren()) do
+						tweakMeteor(child, token)
+					end
+					local added = folder.ChildAdded:Connect(function(child)
+						tweakMeteor(child, token)
+					end)
+					while meteorToken == token and folder.Parent and folder:IsDescendantOf(workspace) do
+						task.wait(0.5)
+					end
+					added:Disconnect()
+				end
+			end)
+		end
+
+		window.Gui.Destroying:Connect(function()
+			setShootingStars(false)
+			setBlueMeteors(false)
 		end)
 
 		local world = window:AddTab("World")
@@ -4075,6 +4660,19 @@ local function loadHub()
 			end,
 		})
 		world:AddLabel("Warm dusky night: soft orange haze, a glowing amber moon, stars and gentle color grading. Also hides the disaster GUIs and clouds, and overrides No fog. Turning it off restores the map's lighting.")
+
+		world:AddSection("Sky")
+		shootingStarsToggle = world:AddToggle({
+			Text = "Shooting stars",
+			Default = false,
+			Callback = setShootingStars,
+		})
+		blueMeteorsToggle = world:AddToggle({
+			Text = "Blue meteors",
+			Default = false,
+			Callback = setBlueMeteors,
+		})
+		world:AddLabel("Shooting stars only appear where you can see them (red, white and light blue streaks). Blue meteors shrinks each meteor to 1 stud and turns its fire and smoke blue; turning it off restores them. Both switch on with Chillax mode.")
 
 		world:AddSection("Environment")
 		world:AddToggle({
@@ -4403,6 +5001,380 @@ local function loadHub()
 		misc:AddLabel("Like fling but without the spinning: walk into someone to fling them. Uses noclip too, and turns off when you die.")
 	end
 
+	----------------------------------------------------------------------
+	-- UI Theme Tab
+	----------------------------------------------------------------------
+	local uiTab = window:AddTab("UI")
+	uiTab:AddSection("In-Game UI Theme")
+	
+	local themeEnabled = false
+	
+	uiThemeToggle = uiTab:AddToggle({
+		Text = "Enable Magenta Theme",
+		Default = false,
+		Callback = function(enabled)
+			themeEnabled = enabled
+			
+			if enabled then
+				-- Apply the magenta theme
+				local ok, err = pcall(function()
+					local ENV = (getgenv and getgenv()) or _G
+					if ENV.__MagentaRetheme and ENV.__MagentaRetheme.Stop then
+						pcall(ENV.__MagentaRetheme.Stop)
+					end
+
+					local CONFIG = {
+						HueShift = 100,
+						AccentMinSat = 0.70,
+						SurfaceHue = 300,
+						SurfaceSat = 0.28,
+						SurfaceMinV = 0.07,
+						SurfaceMaxV = 0.18,
+						TextLight = Color3.fromRGB(235, 228, 238),
+						BorderAccent = Color3.fromRGB(150, 30, 130),
+						DimIcon = Color3.fromRGB(120, 92, 120),
+						Skip = { "^UILib_", "^GloomMoon$" },
+						Backdrops = {
+							backgroundImage = true,
+							imageContainer = true,
+							mapSelection = true,
+							introPanel = true,
+							survivorDisplay = true,
+							mapVote = true,
+						},
+					}
+
+					local function clamp(x, lo, hi)
+						if x < lo then return lo end
+						if x > hi then return hi end
+						return x
+					end
+
+					local function lum(c)
+						return 0.299 * c.R + 0.587 * c.G + 0.114 * c.B
+					end
+
+					local function hsv(c)
+						local h, s, v = c:ToHSV()
+						return h * 360, s, v
+					end
+
+					local function fromHSV(h, s, v)
+						return Color3.fromHSV((h % 360) / 360, clamp(s, 0, 1), clamp(v, 0, 1))
+					end
+
+					local function isBlue(h, s)
+						return s >= 0.12 and h >= 165 and h <= 265
+					end
+
+					local function isAccentBlue(h, s, v)
+						return isBlue(h, s) and s >= 0.4 and v > 0.5
+					end
+
+					local function accent(c)
+						local h, s, v = hsv(c)
+						return fromHSV(h + CONFIG.HueShift, math.max(s, CONFIG.AccentMinSat), v)
+					end
+
+					local function shift(c)
+						local h, s, v = hsv(c)
+						return fromHSV(h + CONFIG.HueShift, s, v)
+					end
+
+					local function surface(L)
+						local t = clamp((L - 0.3) / 0.7, 0, 1)
+						local v = CONFIG.SurfaceMinV + t * (CONFIG.SurfaceMaxV - CONFIG.SurfaceMinV)
+						return fromHSV(CONFIG.SurfaceHue, CONFIG.SurfaceSat, v)
+					end
+
+					local function mapBackground(c)
+						local h, s, v = hsv(c)
+						local L = lum(c)
+						if isBlue(h, s) then
+							if isAccentBlue(h, s, v) then return accent(c) end
+							if L > 0.3 then return surface(L) end
+							return shift(c)
+						end
+						if s > 0.35 then return c end
+						if L > 0.3 then return surface(L) end
+						return c
+					end
+
+					local function mapText(c)
+						local h, s, v = hsv(c)
+						local L = lum(c)
+						if isAccentBlue(h, s, v) then return accent(c) end
+						if s > 0.25 and not isBlue(h, s) then return c end
+						if L < 0.45 then return CONFIG.TextLight end
+						return c
+					end
+
+					local function mapBorder(c)
+						local h, s = hsv(c)
+						if isBlue(h, s) then return shift(c) end
+						if s < 0.12 and lum(c) > 0.6 then return surface(lum(c)) end
+						return c
+					end
+
+					local function mapStroke(c)
+						local h, s = hsv(c)
+						if isBlue(h, s) then return shift(c) end
+						return c
+					end
+
+					local function mapImage(c, inst, isBackdrop)
+						local h, s, v = hsv(c)
+						local L = lum(c)
+						if isBackdrop then
+							if L > 0.55 then return surface(L) end
+							return c
+						end
+						if isBlue(h, s) then
+							if L > 0.8 then
+								local fit = false
+								pcall(function() fit = inst.ScaleType == Enum.ScaleType.Fit end)
+								if fit then
+									if inst.Name:match("^pageButton") then return CONFIG.DimIcon end
+									return fromHSV(h + CONFIG.HueShift, 0.15, v)
+								end
+								return surface(L)
+							end
+							return accent(c)
+						end
+						return c
+					end
+
+					local function isWhite(c)
+						return c.R > 0.99 and c.G > 0.99 and c.B > 0.99
+					end
+
+					local function sequenceHasColor(seq)
+						for _, k in ipairs(seq.Keypoints) do
+							if not isWhite(k.Value) then return true end
+						end
+						return false
+					end
+
+					local function mapSequence(seq, onText)
+						if not sequenceHasColor(seq) then return seq end
+						local out = {}
+						for i, k in ipairs(seq.Keypoints) do
+							local c = k.Value
+							local n
+							if onText then
+								local h, s = hsv(c)
+								n = isBlue(h, s) and accent(c) or c
+							else
+								n = mapBackground(c)
+							end
+							out[i] = ColorSequenceKeypoint.new(k.Time, n)
+						end
+						return ColorSequence.new(out)
+					end
+
+					local function sameValue(a, b)
+						if a == b then return true end
+						local ta = typeof(a)
+						if ta ~= typeof(b) then return false end
+						if ta == "Color3" then
+							return math.abs(a.R - b.R) < 0.003 and math.abs(a.G - b.G) < 0.003 and math.abs(a.B - b.B) < 0.003
+						elseif ta == "ColorSequence" then
+							local ka, kb = a.Keypoints, b.Keypoints
+							if #ka ~= #kb then return false end
+							for i = 1, #ka do
+								if math.abs(ka[i].Time - kb[i].Time) > 0.0005 or not sameValue(ka[i].Value, kb[i].Value) then
+									return false
+								end
+							end
+							return true
+						end
+						return false
+					end
+
+					local originals = setmetatable({}, { __mode = "k" })
+					local connsOf = {}
+					local allConns = {}
+					local running = true
+					local touched = 0
+
+					local function remember(inst, prop, value)
+						local o = originals[inst]
+						if not o then
+							o = {}
+							originals[inst] = o
+						end
+						o[prop] = value
+					end
+
+					local function keepConn(inst, conn)
+						local list = connsOf[inst]
+						if not list then
+							list = {}
+							connsOf[inst] = list
+							local d
+							d = inst.Destroying:Connect(function()
+								for _, c in ipairs(list) do pcall(function() c:Disconnect() end) end
+								connsOf[inst] = nil
+								originals[inst] = nil
+								if d then d:Disconnect() end
+							end)
+						end
+						list[#list + 1] = conn
+						allConns[#allConns + 1] = conn
+					end
+
+					local function track(inst, prop, mapper)
+						local function refresh()
+							if not running then return end
+							local ok, now = pcall(function() return inst[prop] end)
+							if not ok then return end
+							local new = mapper(now, inst)
+							if new ~= nil and not sameValue(now, new) then
+								remember(inst, prop, now)
+								pcall(function() inst[prop] = new end)
+							end
+						end
+						refresh()
+						local ok, sig = pcall(function() return inst:GetPropertyChangedSignal(prop) end)
+						if ok and sig then
+							keepConn(inst, sig:Connect(refresh))
+						end
+					end
+
+					local function topGui(inst)
+						local g = inst
+						while g and g.Parent ~= Players.LocalPlayer.PlayerGui do
+							g = g.Parent
+						end
+						return g
+					end
+
+					local function isSkipped(inst)
+						local g = topGui(inst)
+						if not g then return true end
+						for _, pat in ipairs(CONFIG.Skip) do
+							if g.Name:match(pat) then return true end
+						end
+						return false
+					end
+
+					local function hasTintGradient(inst)
+						for _, ch in ipairs(inst:GetChildren()) do
+							if ch:IsA("UIGradient") and sequenceHasColor(ch.Color) then return true end
+						end
+						return false
+					end
+
+					local function legacyStyle(inst)
+						local isFrame = inst:IsA("Frame")
+						local isBtn = inst:IsA("TextButton") or inst:IsA("ImageButton")
+						if not (isFrame or isBtn) then return end
+						local custom = isFrame and Enum.FrameStyle.Custom or Enum.ButtonStyle.Custom
+						local ok, cur = pcall(function() return inst.Style end)
+						if not ok or cur == custom then return end
+						remember(inst, "Style", cur)
+						pcall(function()
+							inst.Style = custom
+							if inst.BorderSizePixel < 1 then
+								remember(inst, "BorderSizePixel", inst.BorderSizePixel)
+								inst.BorderSizePixel = 1
+							end
+							remember(inst, "BorderColor3", inst.BorderColor3)
+							inst.BorderColor3 = CONFIG.BorderAccent
+						end)
+					end
+
+					local function apply(inst)
+						if not running or isSkipped(inst) then return end
+						touched = touched + 1
+
+						if inst:IsA("GuiObject") then
+							legacyStyle(inst)
+							track(inst, "BackgroundColor3", mapBackground)
+							track(inst, "BorderColor3", mapBorder)
+
+							if inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox") then
+								track(inst, "TextColor3", mapText)
+								track(inst, "TextStrokeColor3", mapStroke)
+							end
+
+							if inst:IsA("ImageLabel") or inst:IsA("ImageButton") then
+								local backdrop = CONFIG.Backdrops[inst.Name] == true
+								track(inst, "ImageColor3", function(c, i)
+									return mapImage(c, i, backdrop and not hasTintGradient(i))
+								end)
+							end
+						elseif inst:IsA("UIStroke") then
+							track(inst, "Color", mapStroke)
+						elseif inst:IsA("UIGradient") then
+							track(inst, "Color", function(seq, g)
+								local p = g.Parent
+								local onText = p ~= nil and (p:IsA("TextLabel") or p:IsA("TextButton") or p:IsA("TextBox"))
+								return mapSequence(seq, onText)
+							end)
+						end
+					end
+
+					local function safeApply(inst)
+						local ok, err = pcall(apply, inst)
+						if not ok then warn("[MagentaRetheme] " .. tostring(inst) .. ": " .. tostring(err)) end
+					end
+
+					local pg = Players.LocalPlayer:WaitForChild("PlayerGui")
+					for _, d in ipairs(pg:GetDescendants()) do
+						safeApply(d)
+					end
+					allConns[#allConns + 1] = pg.DescendantAdded:Connect(safeApply)
+
+					ENV.__MagentaRetheme = {
+						Config = CONFIG,
+						Mappers = {
+							background = mapBackground, text = mapText, border = mapBorder,
+							stroke = mapStroke, image = mapImage, sequence = mapSequence,
+						},
+						Stop = function()
+							running = false
+							for _, c in ipairs(allConns) do pcall(function() c:Disconnect() end) end
+							for inst, props in pairs(originals) do
+								for prop, value in pairs(props) do
+									pcall(function() inst[prop] = value end)
+								end
+							end
+							ENV.__MagentaRetheme = nil
+						end,
+					}
+
+					window:Notify({
+						Title = "UI Theme",
+						Text = ("Magenta theme applied to %d UI objects"):format(touched),
+						Duration = 3
+					})
+				end)
+				
+				if not ok then
+					window:Notify({
+						Title = "UI Theme Error",
+						Text = tostring(err),
+						Duration = 5
+					})
+				end
+			else
+				-- Disable theme
+				local ENV = (getgenv and getgenv()) or _G
+				if ENV.__MagentaRetheme and ENV.__MagentaRetheme.Stop then
+					pcall(ENV.__MagentaRetheme.Stop)
+					window:Notify({
+						Title = "UI Theme",
+						Text = "Theme restored to original",
+						Duration = 3
+					})
+				end
+			end
+		end,
+	})
+	
+	uiTab:AddLabel("Applies dark magenta/plum theme to all in-game UI. Blue accents become magenta, light backgrounds become dark. Health bars and other UI elements maintain full functionality.")
+
 	local settings = window:AddTab("Settings")
 	settings:AddSection("Display")
 	settings:AddDropdown({
@@ -4473,6 +5445,14 @@ local function loadHub()
 		end,
 	})
 	settings:AddKeybind({
+		Text = "Toggle debris forcefield",
+		Default = Keys.Forcefield,
+		Callback = function(k)
+			Keys.Forcefield = k
+			saveKeys()
+		end,
+	})
+	settings:AddKeybind({
 		Text = "Fly forward",
 		Default = Keys.Forward,
 		Callback = function(k)
@@ -4526,7 +5506,7 @@ local function loadHub()
 			or "Your executor has no file access, so keybinds and Chillax mode won't be saved."
 	)
 
-	-- if Chillax mode was left on last time, switch its four features on now that they all exist
+	-- if Chillax mode was left on last time, switch its features on now that they all exist
 	task.defer(function()
 		if Saved.Chillax then
 			setChillax(true)
