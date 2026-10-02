@@ -6068,17 +6068,17 @@ end
 
 	----------------------------------------------------------------------
 	-- Volume Tab
-	-- Every Sound in the game is put into one of a few SoundGroups
-	-- (Party / Disaster / Character / Tools / UI / Other). The sliders only change
-	-- the group volumes, so the game's own scripts can still set Sound.Volume
-	-- freely. Party sounds start at 0% and everything else at 5%. Sounds that
-	-- already belong to a SoundGroup, and Roblox's own CoreGui sounds, are left
-	-- alone. Everything is put back when the hub is closed.
+	-- Every Sound in the game is put into one of a few categories (Party /
+	-- Disaster / Character / Tools / UI / Other). A sound's Volume is set to
+	-- (the game's volume) x (its category's slider). Each sound's Volume is
+	-- hooked: if any script changes it, that new value is taken as the game's
+	-- volume and the slider is applied to it again, so scripts can't undo it.
+	-- Party sounds start at 0% and everything else at 5%. Roblox's own CoreGui
+	-- sounds are left alone. Every volume is put back when the hub is closed.
 	----------------------------------------------------------------------
 	do
 		local SoundService = game:GetService("SoundService")
 		local CoreGui = game:GetService("CoreGui")
-		local GROUP_PREFIX = "HubVolume_"
 
 		local CATEGORIES = {
 			{ id = "Party", label = "Party sounds (Party Palace, music, mini-games)", default = 0 },
@@ -6091,18 +6091,37 @@ end
 
 		local saved = Saved.Volumes -- [id] = percent; missing = default
 
-		local groups = {}
+		local defaults = {}
 		for _, c in ipairs(CATEGORIES) do
-			local g = Instance.new("SoundGroup")
-			g.Name = GROUP_PREFIX .. c.id
-			g.Volume = 1
-			g.Parent = SoundService
-			groups[c.id] = g
+			defaults[c.id] = c.default
+		end
+		local function percentFor(category)
+			return (saved[category] or defaults[category] or 100) / 100
 		end
 
+		-- [sound] = { base = the game's volume, cat = category, applied = what we set,
+		--             conn = Volume hook, t0/n = rate limiter }
+		local info = setmetatable({}, { __mode = "k" })
+		-- stored on each sound so a Clone() of a sound we already scaled isn't scaled twice
+		local ATTR_BASE, ATTR_APPLIED = "HubBaseVolume", "HubAppliedVolume"
+		local EPS = 1e-4
+
+		local function apply(sound, inf)
+			local target = math.clamp(inf.base * percentFor(inf.cat), 0, 10)
+			inf.applied = target
+			pcall(function()
+				if math.abs(sound.Volume - target) > 1e-6 then
+					sound.Volume = target
+				end
+				sound:SetAttribute(ATTR_BASE, inf.base)
+				sound:SetAttribute(ATTR_APPLIED, target)
+			end)
+		end
+
+		-- called after a slider moves
 		local function applyVolumes()
-			for _, c in ipairs(CATEGORIES) do
-				groups[c.id].Volume = (saved[c.id] or c.default) / 100
+			for sound, inf in pairs(info) do
+				apply(sound, inf)
 			end
 		end
 
@@ -6209,24 +6228,46 @@ end
 			return "Other"
 		end
 
-		local tracked = setmetatable({}, { __mode = "k" }) -- [sound] = category
+		-- a script changed a Volume we manage: its value is the new "game volume", so scale it again
+		local function onVolumeChanged(sound, inf)
+			local v = sound.Volume
+			if math.abs(v - inf.applied) <= EPS then
+				return -- that was us
+			end
+			-- safety: if a script and the hook ever fight every frame, back off for a second
+			local now = os.clock()
+			if now - inf.t0 > 1 then
+				inf.t0, inf.n = now, 0
+			end
+			inf.n += 1
+			if inf.n > 60 then
+				return
+			end
+			inf.base = v
+			apply(sound, inf)
+		end
+
 		local function track(sound)
-			if tracked[sound] or sound.SoundGroup ~= nil then
+			if info[sound] then
 				return
 			end
 			if sound:IsDescendantOf(CoreGui) or sound:IsDescendantOf(window.Gui) then
 				return
 			end
-			local category = classify(sound)
-			local ok = pcall(function()
-				sound.SoundGroup = groups[category]
-			end)
-			if ok then
-				tracked[sound] = category
+			local v = sound.Volume
+			local base = v
+			local attrBase, attrApplied = sound:GetAttribute(ATTR_BASE), sound:GetAttribute(ATTR_APPLIED)
+			if type(attrBase) == "number" and type(attrApplied) == "number" and math.abs(v - attrApplied) <= EPS then
+				base = attrBase -- an untouched clone of a sound we already scaled
 			end
+			local inf = { base = base, cat = classify(sound), applied = v, t0 = 0, n = 0 }
+			info[sound] = inf
+			inf.conn = sound:GetPropertyChangedSignal("Volume"):Connect(function()
+				onVolumeChanged(sound, inf)
+			end)
+			apply(sound, inf)
 		end
 
-		applyVolumes()
 		task.spawn(function()
 			local n = 0
 			for _, d in ipairs(game:GetDescendants()) do
@@ -6247,16 +6288,15 @@ end
 
 		window.Gui.Destroying:Connect(function()
 			addedConn:Disconnect()
-			for sound in pairs(tracked) do
+			for sound, inf in pairs(info) do
+				if inf.conn then
+					inf.conn:Disconnect()
+				end
 				pcall(function()
-					local g = sound.SoundGroup
-					if g and string.sub(g.Name, 1, #GROUP_PREFIX) == GROUP_PREFIX then
-						sound.SoundGroup = nil
-					end
+					sound.Volume = inf.base
+					sound:SetAttribute(ATTR_BASE, nil)
+					sound:SetAttribute(ATTR_APPLIED, nil)
 				end)
-			end
-			for _, g in pairs(groups) do
-				g:Destroy()
 			end
 		end)
 
@@ -6294,7 +6334,7 @@ end
 				queueSave()
 			end,
 		})
-		volume:AddLabel("Party sounds start at 0% and everything else at 5%. 100% is the game's normal loudness; going above it makes sounds louder. New sounds (respawns, disasters spawning) are sorted automatically.")
+		volume:AddLabel("Party sounds start at 0% and everything else at 5%. 100% is the game's normal loudness; going above it makes sounds louder. If a script changes a sound's volume, the slider is applied to the new value. New sounds (respawns, disasters spawning) are sorted automatically.")
 	end
 
 	local settings = window:AddTab("Settings")
