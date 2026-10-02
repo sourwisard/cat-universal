@@ -1948,6 +1948,66 @@ local function loadHub()
 		flyKeyConn:Disconnect()
 	end)
 
+	----------------------------------------------------------------------
+	-- Keep hub after teleport (same method as Infinite Yield's "keepiy"):
+	-- hooks LocalPlayer.OnTeleport and, once per teleport, uses
+	-- queue_on_teleport to queue a loadstring of the hub's raw GitHub URL, so
+	-- the hub starts itself again in the next server. Rejoin calls
+	-- queueHubReload() too. Only the on/off state is saved to the save file;
+	-- the reloaded hub reads it, so it stays on. addKeepHubToggle(tab) adds the
+	-- toggle to any tab, and all copies stay in sync.
+	----------------------------------------------------------------------
+	local queueHubReload, addKeepHubToggle
+	do
+		local HUB_URL = "https://raw.githubusercontent.com/sourwisard/cat-universal/main/nds.lua"
+		local queueTp = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+		local queued = false -- queue only once, like keepiy's TeleportCheck
+		local toggles = {}
+
+		queueHubReload = function()
+			if Saved.KeepHub and queueTp and not queued then
+				queued = true
+				queueTp("loadstring(game:HttpGet('" .. HUB_URL .. "'))()")
+			end
+		end
+
+		local tpConn = Players.LocalPlayer.OnTeleport:Connect(queueHubReload)
+		window.Gui.Destroying:Connect(function()
+			tpConn:Disconnect()
+		end)
+
+		addKeepHubToggle = function(tab)
+			local toggle
+			toggle = tab:AddToggle({
+				Text = "Keep hub after teleport / rejoin",
+				Default = Saved.KeepHub and queueTp ~= nil,
+				Callback = function(on)
+					if on and not queueTp then
+						Saved.KeepHub = false
+						for _, t in ipairs(toggles) do
+							t:Set(false, true)
+						end
+						window:Notify({
+							Title = "Keep hub",
+							Text = "Your executor has no queue_on_teleport, so this can't work.",
+							Duration = 4,
+						})
+						return
+					end
+					Saved.KeepHub = on
+					for _, t in ipairs(toggles) do
+						if t ~= toggle then
+							t:Set(on, true)
+						end
+					end
+					saveKeys()
+				end,
+			})
+			table.insert(toggles, toggle)
+			return toggle
+		end
+	end
+
 	local main = window:AddTab("Main")
 	local player = window:AddTab("Player")
 
@@ -5480,6 +5540,8 @@ end
 					end
 				end
 
+				queueHubReload() -- no-op unless "Keep hub" is on
+
 				window:Notify({ Title = "Rejoin", Text = "Rejoining...", Duration = 3 })
 				if #Players:GetPlayers() <= 1 then
 					LocalPlayer:Kick("\nRejoining...")
@@ -5507,7 +5569,8 @@ end
 					keepSpot = on
 				end,
 			})
-			misc:AddLabel("Rejoins the same server (or a new one if you're alone). The hub doesn't carry over, so run the script again after you load in.")
+			addKeepHubToggle(misc)
+			misc:AddLabel("Rejoins the same server (or a new one if you're alone). Turn on Keep hub to have the hub start itself again after you load in.")
 		end
 	end
 
@@ -6174,50 +6237,9 @@ end
 		end,
 	})
 
-	----------------------------------------------------------------------
-	-- Keep hub after teleport (same method as Infinite Yield's "keepiy"):
-	-- hooks LocalPlayer.OnTeleport and, once per teleport, uses
-	-- queue_on_teleport to queue a loadstring of the hub's raw GitHub URL, so
-	-- the hub starts itself again in the next server. Only the on/off state is
-	-- saved to the save file; the reloaded hub reads it, so it stays on.
-	----------------------------------------------------------------------
 	settings:AddSection("Teleport")
-	do
-		local HUB_URL = "https://raw.githubusercontent.com/sourwisard/cat-universal/main/nds.lua"
-		local queueTp = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
-
-		local teleportCheck = false -- queue only once, like keepiy's TeleportCheck
-		local tpConn = Players.LocalPlayer.OnTeleport:Connect(function()
-			if Saved.KeepHub and not teleportCheck and queueTp then
-				teleportCheck = true
-				queueTp("loadstring(game:HttpGet('" .. HUB_URL .. "'))()")
-			end
-		end)
-		window.Gui.Destroying:Connect(function()
-			tpConn:Disconnect()
-		end)
-
-		local keepToggle
-		keepToggle = settings:AddToggle({
-			Text = "Keep hub after teleport",
-			Default = Saved.KeepHub and queueTp ~= nil,
-			Callback = function(on)
-				if on and not queueTp then
-					Saved.KeepHub = false
-					keepToggle:Set(false, true)
-					window:Notify({
-						Title = "Keep hub",
-						Text = "Your executor has no queue_on_teleport, so this can't work.",
-						Duration = 4,
-					})
-					return
-				end
-				Saved.KeepHub = on
-				saveKeys()
-			end,
-		})
-		settings:AddLabel("The hub will run again after you teleport, rejoin or server hop.")
-	end
+	addKeepHubToggle(settings)
+	settings:AddLabel("The hub will run again after you teleport, rejoin or server hop.")
 
 	settings:AddSection("Keybinds")
 	settings:AddKeybind({
