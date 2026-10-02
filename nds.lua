@@ -1456,7 +1456,7 @@ local function loadHub()
 	}
 
 	-- other settings kept in the same save file
-	local Saved = { Chillax = false }
+	local Saved = { Chillax = false, Volumes = {}, KeepHub = false, HubSource = "" }
 
 	local function saveKeys()
 		if not canSave then
@@ -1483,6 +1483,21 @@ local function loadHub()
 			local data = HttpService:JSONDecode(readfile(SAVE_FILE))
 			if type(data.Settings) == "table" and type(data.Settings.Chillax) == "boolean" then
 				Saved.Chillax = data.Settings.Chillax
+			end
+			if type(data.Settings) == "table" and type(data.Settings.Volumes) == "table" then
+				for k, v in pairs(data.Settings.Volumes) do
+					if type(k) == "string" and type(v) == "number" then
+						Saved.Volumes[k] = math.clamp(v, 0, 200)
+					end
+				end
+			end
+			if type(data.Settings) == "table" then
+				if type(data.Settings.KeepHub) == "boolean" then
+					Saved.KeepHub = data.Settings.KeepHub
+				end
+				if type(data.Settings.HubSource) == "string" then
+					Saved.HubSource = data.Settings.HubSource
+				end
 			end
 			for name in pairs(Keys) do
 				local saved = data[name]
@@ -5412,6 +5427,93 @@ local function loadHub()
 			end,
 		})
 		misc:AddLabel("Like fling but without the spinning: walk into someone to fling them. Uses noclip too, and turns off when you die.")
+
+		------------------------------------------------------------------
+		-- Rejoin (same method as Infinite Yield's "rejoin" command):
+		--   * other players in the server -> teleport back into this exact server
+		--   * you're alone -> kick yourself and teleport to a fresh server of the
+		--     same place (teleporting into your own empty server would fail)
+		-- "Rejoin at my position" saves your CFrame as teleport data and queues a
+		-- tiny script that moves you back there once you load in (needs
+		-- queue_on_teleport, so it only works if your executor has it).
+		------------------------------------------------------------------
+		do
+			local TeleportService = game:GetService("TeleportService")
+			local queueTp = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+			local keepSpot = false
+			local rejoining = false
+
+			local RESPAWN_HANDLER = [==[
+local ok, data = pcall(function() return game:GetService("TeleportService"):GetLocalPlayerTeleportData() end)
+if ok and typeof(data) == "CFrame" then
+	local Players = game:GetService("Players")
+	local ME = Players.LocalPlayer
+	while not ME do
+		Players:GetPropertyChangedSignal("LocalPlayer"):Wait()
+		ME = Players.LocalPlayer
+	end
+	local Character = ME.Character or ME.CharacterAdded:Wait()
+	Character:WaitForChild("HumanoidRootPart")
+	local t = tick()
+	while (tick() - t) <= 0.3 do
+		Character:PivotTo(data)
+		task.wait()
+	end
+end
+]==]
+
+			local function rejoin()
+				if rejoining then
+					return
+				end
+				rejoining = true
+
+				local data = nil
+				if keepSpot then
+					if queueTp then
+						local char = LocalPlayer.Character
+						if char then
+							data = char:GetPivot()
+							queueTp(RESPAWN_HANDLER)
+						end
+					else
+						window:Notify({
+							Title = "Rejoin",
+							Text = "Your executor has no queue_on_teleport, so it can't restore your position.",
+							Duration = 4,
+						})
+					end
+				end
+
+				window:Notify({ Title = "Rejoin", Text = "Rejoining...", Duration = 3 })
+				if #Players:GetPlayers() <= 1 then
+					LocalPlayer:Kick("\nRejoining...")
+					task.wait(0.3)
+					TeleportService:Teleport(game.PlaceId, LocalPlayer, data)
+				else
+					TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer, nil, data)
+				end
+
+				-- if the teleport failed, let the button work again
+				task.delay(10, function()
+					rejoining = false
+				end)
+			end
+
+			misc:AddSection("Server")
+			misc:AddButton({
+				Text = "Rejoin server",
+				Callback = rejoin,
+			})
+			misc:AddToggle({
+				Text = "Rejoin at my position",
+				Default = false,
+				Callback = function(on)
+					keepSpot = on
+				end,
+			})
+			misc:AddLabel("Rejoins the same server (or a new one if you're alone). The hub doesn't carry over, so run the script again after you load in.")
+		end
 	end
 
 	----------------------------------------------------------------------
@@ -5826,6 +5928,237 @@ local function loadHub()
 	
 	uiTab:AddLabel("Applies dark magenta/plum theme to all in-game UI. Blue accents become magenta, light backgrounds become dark. Health bars and other UI elements maintain full functionality.")
 
+	----------------------------------------------------------------------
+	-- Volume Tab
+	-- Every Sound in the game is put into one of a few SoundGroups
+	-- (Party / Disaster / Character / Tools / UI / Other). The sliders only change
+	-- the group volumes, so the game's own scripts can still set Sound.Volume
+	-- freely. Party sounds start at 0% and everything else at 5%. Sounds that
+	-- already belong to a SoundGroup, and Roblox's own CoreGui sounds, are left
+	-- alone. Everything is put back when the hub is closed.
+	----------------------------------------------------------------------
+	do
+		local SoundService = game:GetService("SoundService")
+		local CoreGui = game:GetService("CoreGui")
+		local GROUP_PREFIX = "HubVolume_"
+
+		local CATEGORIES = {
+			{ id = "Party", label = "Party sounds (Party Palace, music, mini-games)", default = 0 },
+			{ id = "Disaster", label = "Disaster sounds (wind, explosions, tsunami...)", default = 5 },
+			{ id = "Character", label = "Character sounds (steps, jumps, splash...)", default = 5 },
+			{ id = "Tools", label = "Tool sounds (balloons, apples...)", default = 5 },
+			{ id = "UI", label = "UI and reward sounds", default = 5 },
+			{ id = "Other", label = "Everything else", default = 5 },
+		}
+
+		local saved = Saved.Volumes -- [id] = percent; missing = default
+
+		local groups = {}
+		for _, c in ipairs(CATEGORIES) do
+			local g = Instance.new("SoundGroup")
+			g.Name = GROUP_PREFIX .. c.id
+			g.Volume = 1
+			g.Parent = SoundService
+			groups[c.id] = g
+		end
+
+		local function applyVolumes()
+			for _, c in ipairs(CATEGORIES) do
+				groups[c.id].Volume = (saved[c.id] or c.default) / 100
+			end
+		end
+
+		-- debounced save so dragging a slider doesn't spam writefile
+		local saveToken = 0
+		local function queueSave()
+			saveToken += 1
+			local mine = saveToken
+			task.delay(0.6, function()
+				if mine == saveToken then
+					saveKeys()
+				end
+			end)
+		end
+
+		------------------------------------------------------------------
+		-- classifying sounds
+		------------------------------------------------------------------
+		-- an ancestor with one of these names marks everything below it as disaster
+		local DISASTER_ANCESTORS = {
+			contentmodel = true, tsunamiwave = true, tsunami = true, weathermachine = true,
+			meteortemplate = true, meteor = true, tornado = true, volcano = true,
+			earthquake = true, flood = true, blizzard = true, sandstorm = true,
+			thunderstorm = true, acidrain = true, wildfire = true, hurricane = true,
+		}
+		-- words checked against the sound's own name and its parent's name
+		local DISASTER_WORDS = {
+			"wind", "rain", "lightning", "thunder", "storm", "explo", "avalanche", "tsunami",
+			"meteor", "quake", "volcan", "lava", "flood", "blizzard", "tornado", "hurricane",
+			"acid", "virus", "debris", "rumble", "blast", "snow", "dirtsound", "rocksound",
+		}
+		-- words that contain a disaster word but aren't disasters
+		local FALSE_POSITIVES = { "window", "terrain", "train", "brain", "grain", "drain", "rainbow" }
+		local UI_WORDS = { "award", "reward", "click", "hover", "tick", "dialog", "cheer", "button" }
+
+		local function cleanName(name)
+			name = string.lower(name)
+			for _, bad in ipairs(FALSE_POSITIVES) do
+				name = string.gsub(name, bad, "")
+			end
+			return name
+		end
+
+		local function hasWord(name, words)
+			for _, w in ipairs(words) do
+				if string.find(name, w, 1, true) then
+					return true
+				end
+			end
+			return false
+		end
+
+		local function classify(sound)
+			-- anything inside the Party Palace (or its mini-games / music) is a party sound
+			local up = sound.Parent
+			while up and up ~= game do
+				local lower = string.lower(up.Name)
+				if string.find(lower, "party", 1, true) or string.find(lower, "whackamole", 1, true)
+					or string.find(lower, "hammergame", 1, true) then
+					return "Party"
+				end
+				up = up.Parent
+			end
+
+			if sound:FindFirstAncestorWhichIsA("Tool") then
+				return "Tools"
+			end
+
+			local model = sound:FindFirstAncestorWhichIsA("Model")
+			while model do
+				if model:FindFirstChildOfClass("Humanoid") then
+					return "Character"
+				end
+				model = model:FindFirstAncestorWhichIsA("Model")
+			end
+
+			-- sounds that live in GUIs / SoundService / a "UI" folder
+			if sound:FindFirstAncestorWhichIsA("LayerCollector")
+				or sound:IsDescendantOf(SoundService)
+				or sound:FindFirstAncestorOfClass("PlayerScripts")
+				or sound:IsDescendantOf(game:GetService("StarterPlayer")) then
+				return "UI"
+			end
+			local anc = sound.Parent
+			while anc and anc ~= game do
+				local lower = string.lower(anc.Name)
+				if lower == "ui" then
+					return "UI"
+				end
+				if DISASTER_ANCESTORS[lower] then
+					return "Disaster"
+				end
+				anc = anc.Parent
+			end
+
+			local own = cleanName(sound.Name)
+			local parentName = sound.Parent and cleanName(sound.Parent.Name) or ""
+			if hasWord(own, DISASTER_WORDS) or hasWord(parentName, DISASTER_WORDS) then
+				return "Disaster"
+			end
+			if hasWord(own, UI_WORDS) then
+				return "UI"
+			end
+			return "Other"
+		end
+
+		local tracked = setmetatable({}, { __mode = "k" }) -- [sound] = category
+		local function track(sound)
+			if tracked[sound] or sound.SoundGroup ~= nil then
+				return
+			end
+			if sound:IsDescendantOf(CoreGui) or sound:IsDescendantOf(window.Gui) then
+				return
+			end
+			local category = classify(sound)
+			local ok = pcall(function()
+				sound.SoundGroup = groups[category]
+			end)
+			if ok then
+				tracked[sound] = category
+			end
+		end
+
+		applyVolumes()
+		task.spawn(function()
+			local n = 0
+			for _, d in ipairs(game:GetDescendants()) do
+				if d:IsA("Sound") then
+					track(d)
+				end
+				n += 1
+				if n % 4000 == 0 then
+					task.wait()
+				end
+			end
+		end)
+		local addedConn = game.DescendantAdded:Connect(function(d)
+			if d:IsA("Sound") then
+				track(d)
+			end
+		end)
+
+		window.Gui.Destroying:Connect(function()
+			addedConn:Disconnect()
+			for sound in pairs(tracked) do
+				pcall(function()
+					local g = sound.SoundGroup
+					if g and string.sub(g.Name, 1, #GROUP_PREFIX) == GROUP_PREFIX then
+						sound.SoundGroup = nil
+					end
+				end)
+			end
+			for _, g in pairs(groups) do
+				g:Destroy()
+			end
+		end)
+
+		------------------------------------------------------------------
+		-- the tab
+		------------------------------------------------------------------
+		local volume = window:AddTab("Volume")
+		local sliders = {}
+
+		volume:AddSection("Volumes")
+		for _, c in ipairs(CATEGORIES) do
+			sliders[c.id] = volume:AddSlider({
+				Text = c.label,
+				Min = 0,
+				Max = 200,
+				Default = saved[c.id] or c.default,
+				Step = 1,
+				Suffix = "%",
+				Callback = function(v)
+					saved[c.id] = v
+					applyVolumes()
+					queueSave()
+				end,
+			})
+		end
+
+		volume:AddButton({
+			Text = "Reset to defaults (party 0%, rest 5%)",
+			Callback = function()
+				table.clear(saved)
+				for _, c in ipairs(CATEGORIES) do
+					sliders[c.id]:Set(c.default)
+				end
+				applyVolumes()
+				queueSave()
+			end,
+		})
+		volume:AddLabel("Party sounds start at 0% and everything else at 5%. 100% is the game's normal loudness; going above it makes sounds louder. New sounds (respawns, disasters spawning) are sorted automatically.")
+	end
+
 	local settings = window:AddTab("Settings")
 	settings:AddSection("Display")
 	settings:AddDropdown({
@@ -5845,6 +6178,97 @@ local function loadHub()
 			end
 		end,
 	})
+
+	----------------------------------------------------------------------
+	-- Keep hub after teleport (same idea as Infinite Yield's "keepiy"):
+	-- when you teleport (join another server, rejoin, serverhop...), the hub
+	-- hooks LocalPlayer.OnTeleport once and uses queue_on_teleport to queue a
+	-- one-line loader, so the hub starts itself again in the next server.
+	-- A script can't read its own source, so the loader needs to know where the
+	-- hub comes from: a raw URL (loadstring(game:HttpGet(url))()) or a file in
+	-- the executor's workspace folder (loadstring(readfile(name))()). Leave it
+	-- blank to use workspace/nds.lua if that file exists. Both settings are
+	-- saved, and since the reloaded hub reads the save file, it keeps itself
+	-- on in every server after that.
+	----------------------------------------------------------------------
+	settings:AddSection("Teleport")
+	do
+		local queueTp = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+
+		-- the line that will run in the next server, or nil if no source is known
+		local function buildLoader()
+			local src = Saved.HubSource
+			if src == "" and canSave and isfile("nds.lua") then
+				src = "nds.lua"
+			end
+			if src == "" then
+				return nil
+			end
+			if string.match(src, "^https?://") then
+				return string.format("loadstring(game:HttpGet(%q))()", src)
+			end
+			return string.format("loadstring(readfile(%q))()", src)
+		end
+
+		local queued = false
+		local tpConn = Players.LocalPlayer.OnTeleport:Connect(function()
+			if not Saved.KeepHub or queued or not queueTp then
+				return
+			end
+			local loader = buildLoader()
+			if loader then
+				queued = true -- queue once per teleport, like keepiy
+				queueTp(loader)
+			end
+		end)
+		window.Gui.Destroying:Connect(function()
+			tpConn:Disconnect()
+		end)
+
+		local keepToggle
+		keepToggle = settings:AddToggle({
+			Text = "Keep hub after teleport",
+			Default = Saved.KeepHub and queueTp ~= nil,
+			Callback = function(on)
+				if on and not queueTp then
+					Saved.KeepHub = false
+					keepToggle:Set(false, true)
+					window:Notify({
+						Title = "Keep hub",
+						Text = "Your executor has no queue_on_teleport, so this can't work.",
+						Duration = 4,
+					})
+					return
+				end
+				if on and not buildLoader() then
+					Saved.KeepHub = false
+					keepToggle:Set(false, true)
+					window:Notify({
+						Title = "Keep hub",
+						Text = "Enter a script URL or workspace file name below first.",
+						Duration = 4,
+					})
+					return
+				end
+				Saved.KeepHub = on
+				saveKeys()
+			end,
+		})
+		settings:AddTextbox({
+			Text = "Script URL / file",
+			Placeholder = "raw URL or nds.lua",
+			Default = Saved.HubSource,
+			Callback = function(text)
+				text = string.match(text, "^%s*(.-)%s*$")
+				if text ~= Saved.HubSource then
+					Saved.HubSource = text
+					saveKeys()
+				end
+			end,
+		})
+		settings:AddLabel("Reloads the hub in the next server after you teleport or rejoin. Enter a raw script URL, or the name of a file in your executor's workspace folder (blank = nds.lua if it exists).")
+	end
+
 	settings:AddSection("Keybinds")
 	settings:AddKeybind({
 		Text = "Minimize / restore UI",
@@ -5953,8 +6377,8 @@ local function loadHub()
 	})
 	settings:AddLabel("Click a keybind, then press a key · Esc cancels · Backspace unbinds.")
 	settings:AddLabel(
-		canSave and ("Keybinds and Chillax mode are saved to workspace/" .. SAVE_FILE)
-			or "Your executor has no file access, so keybinds and Chillax mode won't be saved."
+		canSave and ("Keybinds, volumes, Chillax mode and the keep-hub setting are saved to workspace/" .. SAVE_FILE)
+			or "Your executor has no file access, so keybinds, volumes, Chillax mode and the keep-hub setting won't be saved."
 	)
 
 	-- if Chillax mode was left on last time, switch its features on now that they all exist
