@@ -1456,7 +1456,7 @@ local function loadHub()
 	}
 
 	-- other settings kept in the same save file
-	local Saved = { Chillax = false, Volumes = {}, KeepHub = false, HubSource = "" }
+	local Saved = { Chillax = false, Volumes = {}, KeepHub = false }
 
 	local function saveKeys()
 		if not canSave then
@@ -1491,13 +1491,8 @@ local function loadHub()
 					end
 				end
 			end
-			if type(data.Settings) == "table" then
-				if type(data.Settings.KeepHub) == "boolean" then
-					Saved.KeepHub = data.Settings.KeepHub
-				end
-				if type(data.Settings.HubSource) == "string" then
-					Saved.HubSource = data.Settings.HubSource
-				end
+			if type(data.Settings) == "table" and type(data.Settings.KeepHub) == "boolean" then
+				Saved.KeepHub = data.Settings.KeepHub
 			end
 			for name in pairs(Keys) do
 				local saved = data[name]
@@ -6180,45 +6175,22 @@ end
 	})
 
 	----------------------------------------------------------------------
-	-- Keep hub after teleport (same idea as Infinite Yield's "keepiy"):
-	-- when you teleport (join another server, rejoin, serverhop...), the hub
-	-- hooks LocalPlayer.OnTeleport once and uses queue_on_teleport to queue a
-	-- one-line loader, so the hub starts itself again in the next server.
-	-- A script can't read its own source, so the loader needs to know where the
-	-- hub comes from: a raw URL (loadstring(game:HttpGet(url))()) or a file in
-	-- the executor's workspace folder (loadstring(readfile(name))()). Leave it
-	-- blank to use workspace/nds.lua if that file exists. Both settings are
-	-- saved, and since the reloaded hub reads the save file, it keeps itself
-	-- on in every server after that.
+	-- Keep hub after teleport (same method as Infinite Yield's "keepiy"):
+	-- hooks LocalPlayer.OnTeleport and, once per teleport, uses
+	-- queue_on_teleport to queue a loadstring of the hub's raw GitHub URL, so
+	-- the hub starts itself again in the next server. Only the on/off state is
+	-- saved to the save file; the reloaded hub reads it, so it stays on.
 	----------------------------------------------------------------------
 	settings:AddSection("Teleport")
 	do
+		local HUB_URL = "https://raw.githubusercontent.com/sourwisard/cat-universal/main/nds.lua"
 		local queueTp = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
 
-		-- the line that will run in the next server, or nil if no source is known
-		local function buildLoader()
-			local src = Saved.HubSource
-			if src == "" and canSave and isfile("nds.lua") then
-				src = "nds.lua"
-			end
-			if src == "" then
-				return nil
-			end
-			if string.match(src, "^https?://") then
-				return string.format("loadstring(game:HttpGet(%q))()", src)
-			end
-			return string.format("loadstring(readfile(%q))()", src)
-		end
-
-		local queued = false
+		local teleportCheck = false -- queue only once, like keepiy's TeleportCheck
 		local tpConn = Players.LocalPlayer.OnTeleport:Connect(function()
-			if not Saved.KeepHub or queued or not queueTp then
-				return
-			end
-			local loader = buildLoader()
-			if loader then
-				queued = true -- queue once per teleport, like keepiy
-				queueTp(loader)
+			if Saved.KeepHub and not teleportCheck and queueTp then
+				teleportCheck = true
+				queueTp("loadstring(game:HttpGet('" .. HUB_URL .. "'))()")
 			end
 		end)
 		window.Gui.Destroying:Connect(function()
@@ -6240,33 +6212,11 @@ end
 					})
 					return
 				end
-				if on and not buildLoader() then
-					Saved.KeepHub = false
-					keepToggle:Set(false, true)
-					window:Notify({
-						Title = "Keep hub",
-						Text = "Enter a script URL or workspace file name below first.",
-						Duration = 4,
-					})
-					return
-				end
 				Saved.KeepHub = on
 				saveKeys()
 			end,
 		})
-		settings:AddTextbox({
-			Text = "Script URL / file",
-			Placeholder = "raw URL or nds.lua",
-			Default = Saved.HubSource,
-			Callback = function(text)
-				text = string.match(text, "^%s*(.-)%s*$")
-				if text ~= Saved.HubSource then
-					Saved.HubSource = text
-					saveKeys()
-				end
-			end,
-		})
-		settings:AddLabel("Reloads the hub in the next server after you teleport or rejoin. Enter a raw script URL, or the name of a file in your executor's workspace folder (blank = nds.lua if it exists).")
+		settings:AddLabel("The hub will run again after you teleport, rejoin or server hop.")
 	end
 
 	settings:AddSection("Keybinds")
