@@ -5497,6 +5497,7 @@ local function loadHub()
 			local queueTp = queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
 			local keepSpot = false
 			local rejoining = false
+			local hopping = false
 
 			local RESPAWN_HANDLER = [==[
 local ok, data = pcall(function() return game:GetService("TeleportService"):GetLocalPlayerTeleportData() end)
@@ -5518,7 +5519,7 @@ end
 ]==]
 
 			local function rejoin()
-				if rejoining then
+				if rejoining or hopping then
 					return
 				end
 				rejoining = true
@@ -5557,10 +5558,89 @@ end
 				end)
 			end
 
+			----------------------------------------------------------------
+			-- Server hop (same method as Infinite Yield's "serverhop"): asks
+			-- Roblox's public servers list for this place, drops full servers and
+			-- the one you're in, then teleports to a random one of the rest.
+			----------------------------------------------------------------
+			local function fetch(url)
+				local ok, res = pcall(function()
+					return game:HttpGet(url)
+				end)
+				if ok and type(res) == "string" then
+					return res
+				end
+				-- fall back to the executor's request function
+				local req = (syn and syn.request) or http_request or request or (fluxus and fluxus.request)
+				if req then
+					local ok2, r = pcall(req, { Url = url, Method = "GET" })
+					if ok2 and type(r) == "table" and type(r.Body) == "string" then
+						return r.Body
+					end
+				end
+				return nil
+			end
+
+			local function serverHop()
+				if hopping or rejoining then
+					return
+				end
+				hopping = true
+				window:Notify({ Title = "Server hop", Text = "Looking for a server...", Duration = 3 })
+
+				task.spawn(function()
+					local url = "https://games.roblox.com/v1/games/" .. game.PlaceId
+						.. "/servers/Public?sortOrder=Desc&limit=100&excludeFullGames=true"
+					local servers = {}
+					local raw = fetch(url)
+					if raw then
+						local ok, body = pcall(function()
+							return HttpService:JSONDecode(raw)
+						end)
+						if ok and type(body) == "table" and type(body.data) == "table" then
+							for _, v in ipairs(body.data) do
+								if type(v) == "table" and tonumber(v.playing) and tonumber(v.maxPlayers)
+									and v.playing < v.maxPlayers and v.id ~= game.JobId then
+									table.insert(servers, v.id)
+								end
+							end
+						end
+					end
+
+					if #servers == 0 then
+						window:Notify({
+							Title = "Server hop",
+							Text = "Couldn't find a server. Try again in a moment.",
+							Duration = 4,
+						})
+						hopping = false
+						return
+					end
+
+					queueHubReload() -- no-op unless "Keep hub" is on
+					window:Notify({ Title = "Server hop", Text = "Joining a new server...", Duration = 3 })
+					local ok, err = pcall(function()
+						TeleportService:TeleportToPlaceInstance(game.PlaceId, servers[math.random(1, #servers)], LocalPlayer)
+					end)
+					if not ok then
+						warn("Server hop failed:", err)
+					end
+
+					-- if the teleport failed, let the button work again
+					task.delay(10, function()
+						hopping = false
+					end)
+				end)
+			end
+
 			misc:AddSection("Server")
 			misc:AddButton({
 				Text = "Rejoin server",
 				Callback = rejoin,
+			})
+			misc:AddButton({
+				Text = "Server hop",
+				Callback = serverHop,
 			})
 			misc:AddToggle({
 				Text = "Rejoin at my position",
@@ -5570,7 +5650,7 @@ end
 				end,
 			})
 			addKeepHubToggle(misc)
-			misc:AddLabel("Rejoins the same server (or a new one if you're alone). Turn on Keep hub to have the hub start itself again after you load in.")
+			misc:AddLabel("Rejoin goes back into the same server (or a new one if you're alone). Server hop joins a different public server. Turn on Keep hub to have the hub start itself again after you load in.")
 		end
 	end
 
