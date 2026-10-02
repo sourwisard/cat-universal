@@ -124,11 +124,18 @@ local function round(n, step)
 end
 
 local function hoverEffect(button, target, normal, hover)
+	local activeTween = nil
 	button.MouseEnter:Connect(function()
-		tween(target, 0.12, { BackgroundColor3 = hover })
+		if activeTween then
+			activeTween:Cancel()
+		end
+		activeTween = tween(target, 0.12, { BackgroundColor3 = hover })
 	end)
 	button.MouseLeave:Connect(function()
-		tween(target, 0.12, { BackgroundColor3 = normal })
+		if activeTween then
+			activeTween:Cancel()
+		end
+		activeTween = tween(target, 0.12, { BackgroundColor3 = normal })
 	end)
 end
 
@@ -1318,6 +1325,111 @@ end
 ----------------------------------------------------------------------
 -- EXAMPLE: delete everything below this line when making your own UI
 ----------------------------------------------------------------------
+
+----------------------------------------------------------------------
+-- Centralized Frame Management System
+-- Reduces redundant per-frame work by caching and batching updates
+----------------------------------------------------------------------
+local FrameCache = {
+	-- Player list cache (updated once per frame, shared by all systems)
+	players = {},
+	playersFrame = 0,
+	
+	-- Character cache (avoids repeated GetDescendants calls)
+	charParts = {}, -- [character] = { parts = {}, frame = n }
+	
+	-- Humanoid root cache
+	localRoot = nil,
+	localChar = nil,
+	localHum = nil,
+	rootFrame = 0,
+	
+	-- Property change tracking (only write when values actually change)
+	lastValues = {}, -- [instance] = { [property] = value }
+}
+
+-- Get all players (cached per frame)
+function FrameCache:GetPlayers()
+	local frame = workspace:GetServerTimeNow()
+	if self.playersFrame ~= frame then
+		self.players = Players:GetPlayers()
+		self.playersFrame = frame
+	end
+	return self.players
+end
+
+-- Get local character components (cached)
+function FrameCache:GetLocalCharacter()
+	local frame = workspace:GetServerTimeNow()
+	if self.rootFrame == frame and self.localRoot and self.localRoot.Parent then
+		return self.localChar, self.localHum, self.localRoot
+	end
+	
+	local char = Players.LocalPlayer.Character
+	if not char then
+		self.localChar, self.localHum, self.localRoot = nil, nil, nil
+		return nil, nil, nil
+	end
+	
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local root = char:FindFirstChild("HumanoidRootPart")
+	
+	if hum and root then
+		self.localChar, self.localHum, self.localRoot = char, hum, root
+		self.rootFrame = frame
+		return char, hum, root
+	end
+	
+	self.localChar, self.localHum, self.localRoot = nil, nil, nil
+	return nil, nil, nil
+end
+
+-- Get character parts (cached, reused across multiple systems)
+function FrameCache:GetCharacterParts(character, maxAge)
+	maxAge = maxAge or 20
+	local frame = workspace:GetServerTimeNow()
+	local entry = self.charParts[character]
+	
+	if entry and frame - entry.frame < maxAge and entry.parts[1] and entry.parts[1].Parent then
+		return entry.parts
+	end
+	
+	local parts = {}
+	for _, d in ipairs(character:GetDescendants()) do
+		if d:IsA("BasePart") then
+			table.insert(parts, d)
+		end
+	end
+	
+	self.charParts[character] = { parts = parts, frame = frame }
+	return parts
+end
+
+-- Only set a property if it actually changed
+function FrameCache:SetProperty(instance, property, value)
+	local key = instance
+	if not self.lastValues[key] then
+		self.lastValues[key] = {}
+	end
+	
+	local last = self.lastValues[key][property]
+	if last ~= value then
+		instance[property] = value
+		self.lastValues[key][property] = value
+		return true
+	end
+	return false
+end
+
+-- Clear stale character caches
+function FrameCache:CleanCharacterCache()
+	for char, entry in pairs(self.charParts) do
+		if not char.Parent then
+			self.charParts[char] = nil
+		end
+	end
+end
+
 local function loadHub()
 	----------------------------------------------------------------------
 	-- Keybinds: saved to a file in the executor's workspace folder (like
@@ -1831,7 +1943,7 @@ local function loadHub()
 
 	-- handles filled in further down; Chillax mode drives them
 	local waterToggle, antiFlingToggle, gloomToggle, antiQuakeToggle, chillaxToggle
-	local shootingStarsToggle, blueMeteorsToggle, forcefieldToggle, dodgeMeteorToggle, uiThemeToggle
+	local shootingStarsToggle, blueMeteorsToggle, forcefieldToggle, dodgeMeteorToggle, uiThemeToggle, virusImmuneToggle
 	local function setChillax(on)
 		if waterToggle then
 			waterToggle:Set(on)
@@ -1854,6 +1966,9 @@ local function loadHub()
 		if dodgeMeteorToggle then
 			dodgeMeteorToggle:Set(on)
 		end
+		if virusImmuneToggle then
+			virusImmuneToggle:Set(on)
+		end
 		if uiThemeToggle then
 			uiThemeToggle:Set(on)
 		end
@@ -1869,7 +1984,7 @@ local function loadHub()
 			saveKeys()
 		end,
 	})
-	main:AddLabel("Turns the water platform, anti fling, anti earthquake, gloomy night, shooting stars, blue meteors, dodge meteor, and magenta UI theme on together, and off again when you switch it off. Off by default; if you turn it on it stays on next time.")
+	main:AddLabel("Turns the water platform, anti fling, anti earthquake, gloomy night, shooting stars, blue meteors, dodge meteor, virus immune, and magenta UI theme on together, and off again when you switch it off. Off by default; if you turn it on it stays on next time.")
 
 	----------------------------------------------------------------------
 	-- Save player: while the toggle is on, whoever is under your aim (the mouse,
@@ -2514,10 +2629,12 @@ local function loadHub()
 		end
 		if on then
 			antiFlingConn = RunService.Stepped:Connect(function()
-				for _, plr in ipairs(Players:GetPlayers()) do
+				for _, plr in ipairs(FrameCache:GetPlayers()) do
 					if plr ~= Players.LocalPlayer and plr.Character then
-						for _, v in ipairs(plr.Character:GetDescendants()) do
-							if v:IsA("BasePart") and v.CanCollide then
+						-- Use cached character parts instead of GetDescendants every step
+						local parts = FrameCache:GetCharacterParts(plr.Character, 20)
+						for _, v in ipairs(parts) do
+							if v.CanCollide then
 								antiFlingChanged[v] = true
 								v.CanCollide = false
 							end
@@ -2750,6 +2867,7 @@ local function loadHub()
 		-- watches for workspace.Structure.FloodLevel: build the grid when it shows up,
 		-- keep it on the flood's surface, delete it as soon as FloodLevel is gone
 		local function startFloodPlatform()
+			local lastFloodY = nil
 			floodConn = RunService.Heartbeat:Connect(function()
 				local structure = workspace:FindFirstChild("Structure")
 				local flood = structure and structure:FindFirstChild("FloodLevel")
@@ -2758,14 +2876,18 @@ local function loadHub()
 					if floodFolder then
 						destroyFloodPlatform()
 					end
+					lastFloodY = nil
 					return
 				end
 				if not floodFolder then
 					floodFolder, floodEntries = buildGrid("FloodPlatforms", "FloodPlatform", y)
-				else
+					lastFloodY = y
+				elseif not lastFloodY or math.abs(y - lastFloodY) > 0.01 then
+					-- Only update CFrame when Y actually changed
 					for _, e in ipairs(floodEntries) do
 						e.part.CFrame = CFrame.new(e.x, y, e.z)
 					end
+					lastFloodY = y
 				end
 			end)
 		end
@@ -2788,12 +2910,15 @@ local function loadHub()
 				local entries
 				platFolder, entries = buildGrid("WaterPlatforms", "WaterPlatform", y0)
 
+				local lastWaterY = y0
 				platConn = RunService.Heartbeat:Connect(function()
 					local y = getWaterY(water)
-					if y then
+					if y and math.abs(y - lastWaterY) > 0.01 then
+						-- Only update CFrame when Y actually changed
 						for _, e in ipairs(entries) do
 							e.part.CFrame = CFrame.new(e.x, y, e.z)
 						end
+						lastWaterY = y
 					end
 				end)
 			end)
@@ -3098,7 +3223,7 @@ local function loadHub()
 		local LocalPlayer = Players.LocalPlayer
 		local shieldOn = false
 		local shieldConn = nil
-		local shieldRadius = 30
+		local shieldRadius = 100
 		local shieldStrength = 80
 		local LIFT = 0.25 -- upward bias so pushed pieces don't scrape along the ground
 		local SHOVE_MULT = 8 -- extra push right next to you, as a multiple of the strength slider
@@ -3107,8 +3232,8 @@ local function loadHub()
 		local RETAIN_NUDGE = 0.002 -- studs/s, far too small to move anything; just keeps ownership
 		local LOOKAHEAD = 0.12 -- seconds; pieces heading at you are treated as this much closer
 		local nudgeSign = 1
-		local HIGH_VEL = 20 -- studs/s; only pieces moving at least this fast lose collision (any speed during an earthquake)
-		local HIGH_VEL_EXIT = 10 -- once non-solid, a piece stays non-solid until it slows below this (stops flicker at the threshold)
+		local HIGH_VEL = 15 -- studs/s; only pieces moving at least this fast lose collision (any speed during an earthquake); set by the Noclip speed slider
+		local HIGH_VEL_EXIT = HIGH_VEL / 2 -- once non-solid, a piece stays non-solid until it slows below this (stops flicker at the threshold)
 		local fastAsm = {} -- [assembly root] = true while it is non-solid because of its speed
 		local changed = {} -- [part] = original CanCollide
 		local origFocus = nil
@@ -3145,6 +3270,8 @@ local function loadHub()
 
 		local frame = 0
 		local asmCache = {} -- [assembly root] = { parts = {...}, frame = n } so connected parts aren't re-queried every frame
+		local excludeCache = {} -- cached player character list, rebuilt every 10 frames
+		local excludeFrame = 0
 
 		-- can we actually move this piece? velocity only sticks on pieces your client simulates
 		local hasOwnerCheck = type(isnetworkowner) == "function"
@@ -3168,14 +3295,17 @@ local function loadHub()
 			local quake = quakeNow()
 
 			if root then
-				-- never touch any player's character
-				local exclude = {}
-				for _, plr in ipairs(Players:GetPlayers()) do
-					if plr.Character then
-						table.insert(exclude, plr.Character)
+				-- never touch any player's character - cache the exclude list for 10 frames
+				if frame - excludeFrame >= 10 then
+					table.clear(excludeCache)
+					for _, plr in ipairs(FrameCache:GetPlayers()) do
+						if plr.Character then
+							table.insert(excludeCache, plr.Character)
+						end
 					end
+					excludeFrame = frame
 				end
-				overlap.FilterDescendantsInstances = exclude
+				overlap.FilterDescendantsInstances = excludeCache
 
 				local center = root.Position
 
@@ -3254,6 +3384,8 @@ local function loadHub()
 									local ok, list = pcall(asm.GetConnectedParts, asm, true)
 									c = { parts = ok and list or { asm }, frame = frame }
 									asmCache[asm] = c
+								else
+									c.frame = frame -- keep it fresh
 								end
 								for _, p in ipairs(c.parts) do
 									if changed[p] == nil then
@@ -3370,7 +3502,15 @@ local function loadHub()
 				shieldStrength = v
 			end,
 		})
-		disasters:AddLabel("Invisible sphere that pushes debris away from you. Pieces you don't own are made non-solid. Press X to toggle. Not part of Chillax mode.")
+		disasters:AddSlider({
+			Text = "Noclip speed",
+			Min = 1, Max = 100, Default = 15, Step = 1, Suffix = " st/s",
+			Callback = function(v)
+				HIGH_VEL = v
+				HIGH_VEL_EXIT = v / 2
+			end,
+		})
+		disasters:AddLabel("Invisible sphere that pushes debris away from you. Pieces you don't own are made non-solid once they move faster than the Noclip speed (slower ones stay solid so they can't sink through the floor). Press X to toggle. Not part of Chillax mode.")
 	end
 
 	----------------------------------------------------------------------
@@ -3500,12 +3640,17 @@ local function loadHub()
 			return best, bestDist
 		end
 
+		-- Cache for escapeIfNeeded to avoid repeated FindFirstChild calls
+		local escapeFilterCache = {}
+		local escapeFilterFrame = 0
+		local ESCAPE_CACHE_DURATION = 5 -- frames to cache the filter list
+		
 		-- if the player is inside DANGER_RADIUS of a predicted impact, move them to a clear spot further away
 		local function escapeIfNeeded(now)
 			if now - lastEscape < ESCAPE_COOLDOWN then
 				return
 			end
-			local char, hum, root = getCharacter()
+			local char, hum, root = FrameCache:GetLocalCharacter()
 			if not root then
 				return
 			end
@@ -3526,14 +3671,21 @@ local function loadHub()
 			end
 			away = away.Unit
 
-			local filter = { char, visuals }
-			local structure = workspace:FindFirstChild("Structure")
-			local meteors = structure and structure:FindFirstChild("MeteorFolder")
-			if meteors then
-				table.insert(filter, meteors)
+			-- Cache the filter list for a few frames (escapeIfNeeded is called every frame when meteors exist)
+			local frame = workspace:GetServerTimeNow()
+			if frame - escapeFilterFrame >= ESCAPE_CACHE_DURATION then
+				table.clear(escapeFilterCache)
+				table.insert(escapeFilterCache, char)
+				table.insert(escapeFilterCache, visuals)
+				local structure = workspace:FindFirstChild("Structure")
+				local meteors = structure and structure:FindFirstChild("MeteorFolder")
+				if meteors then
+					table.insert(escapeFilterCache, meteors)
+				end
+				escapeFilterFrame = frame
 			end
-			groundParams.FilterDescendantsInstances = filter
-			overlapParams.FilterDescendantsInstances = filter
+			groundParams.FilterDescendantsInstances = escapeFilterCache
+			overlapParams.FilterDescendantsInstances = escapeFilterCache
 
 			local stand = hum.HipHeight + root.Size.Y / 2 + 0.5
 			if hum.RigType == Enum.HumanoidRigType.R6 then
@@ -3573,9 +3725,9 @@ local function loadHub()
 			local now = os.clock()
 
 			if folder then
-				-- ignore every meteor (including the one being predicted), the pillars and all characters
+				-- Cache filter list - rebuild only when needed (use FrameCache player list)
 				local filter = { folder, visuals }
-				for _, plr in ipairs(Players:GetPlayers()) do
+				for _, plr in ipairs(FrameCache:GetPlayers()) do
 					if plr.Character then
 						table.insert(filter, plr.Character)
 					end
@@ -3687,6 +3839,174 @@ local function loadHub()
 	end
 
 	----------------------------------------------------------------------
+	-- Virus immune: while on, every TouchInterest inside
+	-- workspace.Structure.VirusParticles is destroyed (new particles too) and the
+	-- parts get CanTouch = false as a backup, so
+	-- touching a virus particle can't register on your client. The folder only
+	-- exists during the virus disaster, so it is watched for and picked up
+	-- when it appears. Removed TouchInterests are not restored when you turn
+	-- it off (the particles are gone when the round ends anyway).
+	----------------------------------------------------------------------
+	do
+		local virusToken = 0
+		local hookedFolder = nil
+		local folderConn = nil
+
+		-- the instance Dex shows as "TouchInterest" has the class TouchTransmitter
+		local function isTouch(x)
+			return x.ClassName == "TouchTransmitter" or x.ClassName == "TouchInterest"
+		end
+
+		-- Finds the TouchInterest(s) on a part. Several routes are tried because
+		-- some executors hide internal instances from some of the lookups.
+		local function findTouch(part)
+			local found, seen = {}, {}
+			local function add(x)
+				if x and not seen[x] and isTouch(x) then
+					seen[x] = true
+					table.insert(found, x)
+				end
+			end
+			pcall(function()
+				add(part:FindFirstChildOfClass("TouchTransmitter"))
+			end)
+			pcall(function()
+				add(part:FindFirstChild("TouchInterest"))
+			end)
+			pcall(function()
+				add(part.TouchInterest)
+			end)
+			pcall(function()
+				for _, c in ipairs(part:GetChildren()) do
+					add(c)
+				end
+			end)
+			return found
+		end
+
+		-- Removes one TouchInterest. Besides destroying it, the part it belongs to
+		-- gets CanTouch = false, which stops Touched from firing for that part even
+		-- if the TouchInterest itself can't be removed or gets re-added.
+		local function killTouch(ti)
+			local part = ti.Parent
+			if part and part:IsA("BasePart") then
+				pcall(function()
+					part.CanTouch = false
+				end)
+			end
+			pcall(function()
+				ti:Destroy()
+			end)
+			if ti.Parent then
+				pcall(function()
+					ti.Parent = nil
+				end)
+			end
+		end
+
+		local function stripPart(part)
+			pcall(function()
+				part.CanTouch = false
+			end)
+			for _, ti in ipairs(findTouch(part)) do
+				killTouch(ti)
+			end
+			-- also switch off any script connections on the part's touch signals
+			if type(getconnections) == "function" then
+				for _, sigName in ipairs({ "Touched", "TouchEnded" }) do
+					pcall(function()
+						for _, c in ipairs(getconnections(part[sigName])) do
+							pcall(function()
+								c:Disable()
+							end)
+						end
+					end)
+				end
+			end
+		end
+
+		local function stripTouch(root)
+			if root:IsA("BasePart") then
+				stripPart(root)
+			end
+			for _, d in ipairs(root:GetDescendants()) do
+				if isTouch(d) then
+					killTouch(d)
+				elseif d:IsA("BasePart") then
+					stripPart(d)
+				end
+			end
+		end
+
+		local function unhook()
+			if folderConn then
+				folderConn:Disconnect()
+				folderConn = nil
+			end
+			hookedFolder = nil
+		end
+
+		local function hook(folder)
+			unhook()
+			hookedFolder = folder
+			stripTouch(folder)
+			folderConn = folder.DescendantAdded:Connect(function(d)
+				if isTouch(d) then
+					killTouch(d)
+				elseif d:IsA("BasePart") then
+					pcall(function()
+						d.CanTouch = false
+					end)
+					-- the TouchInterest can arrive just after its part
+					task.defer(function()
+						if d.Parent then
+							stripPart(d)
+						end
+					end)
+				end
+			end)
+		end
+
+		local function setVirusImmune(on)
+			virusToken += 1
+			local token = virusToken
+			unhook()
+			if not on then
+				return
+			end
+			task.spawn(function()
+				while virusToken == token do
+					pcall(function()
+						local structure = workspace:FindFirstChild("Structure")
+						local folder = structure and structure:FindFirstChild("VirusParticles")
+						if folder and folder ~= hookedFolder then
+							hook(folder)
+						elseif folder then
+							-- sweep as a fallback in case anything slipped through or was re-added
+							stripTouch(folder)
+						elseif hookedFolder then
+							unhook() -- folder is gone (disaster over); wait for the next one
+						end
+					end)
+					task.wait(0.25)
+				end
+			end)
+		end
+
+		window.Gui.Destroying:Connect(function()
+			setVirusImmune(false)
+		end)
+
+		disasters:AddSection("Virus")
+		virusImmuneToggle = disasters:AddToggle({
+			Text = "Virus immune",
+			Default = false,
+			Callback = setVirusImmune,
+		})
+		disasters:AddLabel("Removes every TouchInterest from the particles in workspace.Structure.VirusParticles (including ones that spawn later) so the virus can't touch you. Switches on with Chillax mode.")
+	end
+
+	----------------------------------------------------------------------
 	-- Visuals tab: player ESP (executor Drawing library)
 	----------------------------------------------------------------------
 	do
@@ -3790,6 +4110,18 @@ local function loadHub()
 	end
 
 	local function updateESP()
+		-- Early exit when ESP is disabled - don't do any work at all
+		if not espCfg.Enabled then
+			-- Hide all ESP on first frame after disabling
+			for plr, o in pairs(espObjects) do
+				if not o.hidden then
+					hideESP(o)
+					o.hidden = true
+				end
+			end
+			return
+		end
+		
 		local cam = workspace.CurrentCamera
 		if not cam then
 			return
@@ -3798,12 +4130,21 @@ local function loadHub()
 		local camPos = cam.CFrame.Position
 
 		for plr, o in pairs(espObjects) do
+			-- Skip 4 FindFirstChild calls before the enabled check by checking character validity first
 			local char = plr.Character
-			local hum = char and char:FindFirstChildOfClass("Humanoid")
-			local root = char and char:FindFirstChild("HumanoidRootPart")
-			local head = char and char:FindFirstChild("Head")
+			if not char then
+				if not o.hidden then
+					hideESP(o)
+					o.hidden = true
+				end
+				continue
+			end
+			
+			local hum = char:FindFirstChildOfClass("Humanoid")
+			local root = char:FindFirstChild("HumanoidRootPart")
+			local head = char:FindFirstChild("Head")
 
-			local show = espCfg.Enabled and hum ~= nil and root ~= nil and head ~= nil and hum.Health > 0
+			local show = hum ~= nil and root ~= nil and head ~= nil and hum.Health > 0
 			local dist = 0
 			if show then
 				dist = (camPos - root.Position).Magnitude
@@ -3837,31 +4178,47 @@ local function loadHub()
 				local boxPos = Vector2.new(left, math.floor(top))
 				local boxSize = Vector2.new(math.floor(w), math.floor(h))
 
-				o.boxOutline.Visible = espCfg.Boxes
-				o.box.Visible = espCfg.Boxes
-				if espCfg.Boxes then
+				-- Only update properties that are actually visible
+				local boxVis = espCfg.Boxes
+				if o.boxOutline.Visible ~= boxVis then
+					o.boxOutline.Visible = boxVis
+				end
+				if o.box.Visible ~= boxVis then
+					o.box.Visible = boxVis
+				end
+				if boxVis then
 					o.boxOutline.Position, o.boxOutline.Size = boxPos, boxSize
 					o.box.Position, o.box.Size, o.box.Color = boxPos, boxSize, col
 				end
 
-				o.name.Visible = espCfg.Names
-				if espCfg.Names then
+				local nameVis = espCfg.Names
+				if o.name.Visible ~= nameVis then
+					o.name.Visible = nameVis
+				end
+				if nameVis then
 					o.name.Text = plr.DisplayName ~= plr.Name and (plr.DisplayName .. " (@" .. plr.Name .. ")") or plr.Name
 					o.name.Color = col
 					o.name.Position = Vector2.new(cx, top - 18)
 				end
 
 				local showInfo = espCfg.Distance
-				o.info.Visible = showInfo
+				if o.info.Visible ~= showInfo then
+					o.info.Visible = showInfo
+				end
 				if showInfo then
 					o.info.Text = string.format("%d studs", dist)
 					o.info.Color = Color3.new(1, 1, 1)
 					o.info.Position = Vector2.new(cx, bottom + 2)
 				end
 
-				o.healthOutline.Visible = espCfg.Health
-				o.health.Visible = espCfg.Health
-				if espCfg.Health then
+				local healthVis = espCfg.Health
+				if o.healthOutline.Visible ~= healthVis then
+					o.healthOutline.Visible = healthVis
+				end
+				if o.health.Visible ~= healthVis then
+					o.health.Visible = healthVis
+				end
+				if healthVis then
 					local frac = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
 					local x = left - 5
 					o.healthOutline.From = Vector2.new(x, bottom + 1)
@@ -3871,31 +4228,44 @@ local function loadHub()
 					o.health.Color = Color3.fromRGB(255, 60, 60):Lerp(Color3.fromRGB(70, 255, 100), frac)
 				end
 
-				o.tracer.Visible = espCfg.Tracers
-				if espCfg.Tracers then
+				local tracerVis = espCfg.Tracers
+				if o.tracer.Visible ~= tracerVis then
+					o.tracer.Visible = tracerVis
+				end
+				if tracerVis then
 					o.tracer.From = Vector2.new(vp.X / 2, vp.Y)
 					o.tracer.To = Vector2.new(cx, bottom)
 					o.tracer.Color = col
 				end
 
-				local bonesList = char:FindFirstChild("UpperTorso") and R15_BONES or R6_BONES
-				for i, b in ipairs(o.bones) do
-					local pair = espCfg.Skeleton and bonesList[i]
-					local a = pair and char:FindFirstChild(pair[1])
-					local c = pair and char:FindFirstChild(pair[2])
-					if a and c then
-						local av = cam:WorldToViewportPoint(a.Position)
-						local cv = cam:WorldToViewportPoint(c.Position)
-						if av.Z > 0 and cv.Z > 0 then
-							b.From = Vector2.new(av.X, av.Y)
-							b.To = Vector2.new(cv.X, cv.Y)
-							b.Color = col
-							b.Visible = true
+				-- Skeleton mode adds heavy lookups - only do them if enabled
+				if espCfg.Skeleton then
+					local bonesList = char:FindFirstChild("UpperTorso") and R15_BONES or R6_BONES
+					for i, b in ipairs(o.bones) do
+						local pair = bonesList[i]
+						local a = pair and char:FindFirstChild(pair[1])
+						local c = pair and char:FindFirstChild(pair[2])
+						if a and c then
+							local av = cam:WorldToViewportPoint(a.Position)
+							local cv = cam:WorldToViewportPoint(c.Position)
+							if av.Z > 0 and cv.Z > 0 then
+								b.From = Vector2.new(av.X, av.Y)
+								b.To = Vector2.new(cv.X, cv.Y)
+								b.Color = col
+								b.Visible = true
+							else
+								b.Visible = false
+							end
 						else
 							b.Visible = false
 						end
-					else
-						b.Visible = false
+					end
+				else
+					-- Hide all bones when skeleton is off
+					for _, b in ipairs(o.bones) do
+						if b.Visible then
+							b.Visible = false
+						end
 					end
 				end
 			end
@@ -4093,9 +4463,7 @@ local function loadHub()
 			if skyInst and skyInst.Parent then
 				for face, id in pairs(SKY_FACES) do
 					local want = gloomAmount >= 0.5 and id or skyOrig[face]
-					if skyInst[face] ~= want then
-						skyInst[face] = want
-					end
+					FrameCache:SetProperty(skyInst, face, want)
 				end
 			end
 			for _, e in ipairs(entries) do
@@ -4105,10 +4473,7 @@ local function loadHub()
 						if prop == "StarCount" then
 							v = math.floor(v + 0.5)
 						end
-						local cur = e.inst[prop]
-						if cur ~= v and (typeof(v) ~= "number" and typeof(v) ~= "Color3" or differs(cur, v)) then
-							e.inst[prop] = v
-						end
+						FrameCache:SetProperty(e.inst, prop, v)
 					end
 				end
 			end
@@ -4241,13 +4606,21 @@ local function loadHub()
 				end
 				local dir = Lighting:GetMoonDirection()
 				moonPart.CFrame = CFrame.new(c.CFrame.Position + dir * MOON_DIST)
-				moonGui.Enabled = dir.Y > -0.03 -- hide once it sets below the horizon
-				for _, item in ipairs(moonFade) do
-					local inst, base, kind = item[1], item[2], item[3]
-					if kind == "img" then
-						inst.ImageTransparency = 1 - gloomAmount
-					else
-						inst.BackgroundTransparency = 1 - (1 - base) * gloomAmount
+				local enabled = dir.Y > -0.03 -- hide once it sets below the horizon
+				if moonGui.Enabled ~= enabled then
+					moonGui.Enabled = enabled
+				end
+				
+				-- Only update transparency values when gloomAmount actually changed
+				-- (avoiding 50+ property writes per frame when the slider isn't moving)
+				if enabled then
+					for _, item in ipairs(moonFade) do
+						local inst, base, kind = item[1], item[2], item[3]
+						if kind == "img" then
+							FrameCache:SetProperty(inst, "ImageTransparency", 1 - gloomAmount)
+						else
+							FrameCache:SetProperty(inst, "BackgroundTransparency", 1 - (1 - base) * gloomAmount)
+						end
 					end
 				end
 			end)
@@ -4814,8 +5187,10 @@ local function loadHub()
 				if not char then
 					return
 				end
-				for _, d in ipairs(char:GetDescendants()) do
-					if d:IsA("BasePart") and d.CanCollide then
+				-- Use cached character parts instead of GetDescendants every step
+				local parts = FrameCache:GetCharacterParts(char, 15)
+				for _, d in ipairs(parts) do
+					if d.CanCollide then
 						noclipChanged[d] = true
 						d.CanCollide = false
 					end
@@ -4934,28 +5309,66 @@ local function loadHub()
 			end)
 			startNoclip()
 
+			-- Optimized: use connections instead of yielding in a loop
 			local movel = 0.1
-			while walkToken == token do
-				RunService.Heartbeat:Wait()
+			local savedVel = nil
+			local phase = 1 -- 1=heartbeat, 2=render, 3=stepped
+			
+			local function cycle()
 				if walkToken ~= token then
-					break
+					return
 				end
 				local _, _, r = getCharacter()
-				if r then
-					local vel = r.AssemblyLinearVelocity
-					r.AssemblyLinearVelocity = vel * 10000 + Vector3.new(0, 10000, 0)
-
-					RunService.RenderStepped:Wait()
-					if walkToken == token and r.Parent then
-						r.AssemblyLinearVelocity = vel
+				if not r then
+					return
+				end
+				
+				if phase == 1 then
+					-- Heartbeat: spike velocity
+					savedVel = r.AssemblyLinearVelocity
+					r.AssemblyLinearVelocity = savedVel * 10000 + Vector3.new(0, 10000, 0)
+					phase = 2
+				elseif phase == 2 then
+					-- RenderStepped: restore velocity
+					if r.Parent and savedVel then
+						r.AssemblyLinearVelocity = savedVel
 					end
-
-					RunService.Stepped:Wait()
-					if walkToken == token and r.Parent then
-						r.AssemblyLinearVelocity = vel + Vector3.new(0, movel, 0)
+					phase = 3
+				elseif phase == 3 then
+					-- Stepped: add oscillation
+					if r.Parent and savedVel then
+						r.AssemblyLinearVelocity = savedVel + Vector3.new(0, movel, 0)
 						movel = -movel
 					end
+					phase = 1
 				end
+			end
+			
+			local hb = RunService.Heartbeat:Connect(function()
+				if phase == 1 then
+					cycle()
+				end
+			end)
+			local rs = RunService.RenderStepped:Connect(function()
+				if phase == 2 then
+					cycle()
+				end
+			end)
+			local st = RunService.Stepped:Connect(function()
+				if phase == 3 then
+					cycle()
+				end
+			end)
+			
+			-- Clean up connections when stopped
+			local oldStop = stopWalkFling
+			stopWalkFling = function()
+				hb:Disconnect()
+				rs:Disconnect()
+				st:Disconnect()
+				savedVel = nil
+				oldStop()
+				stopWalkFling = oldStop
 			end
 		end
 
@@ -5223,18 +5636,56 @@ local function loadHub()
 						allConns[#allConns + 1] = conn
 					end
 
+					local pendingRefresh = {} -- [inst][prop] = true for pending refreshes
+					local refreshScheduled = false
+					
+					-- Batched refresh: processes all pending changes at once
+					local function processBatchedRefreshes()
+						refreshScheduled = false
+						for inst, props in pairs(pendingRefresh) do
+							for prop, mapper in pairs(props) do
+								if running then
+									local ok, now = pcall(function() return inst[prop] end)
+									if ok then
+										local new = mapper(now, inst)
+										if new ~= nil and not sameValue(now, new) then
+											remember(inst, prop, now)
+											pcall(function() inst[prop] = new end)
+										end
+									end
+								end
+							end
+						end
+						table.clear(pendingRefresh)
+					end
+					
 					local function track(inst, prop, mapper)
 						local function refresh()
 							if not running then return end
-							local ok, now = pcall(function() return inst[prop] end)
-							if not ok then return end
+							-- Batch this refresh instead of processing immediately
+							if not pendingRefresh[inst] then
+								pendingRefresh[inst] = {}
+							end
+							pendingRefresh[inst][prop] = mapper
+							
+							-- Schedule a single batch process on the next frame
+							if not refreshScheduled then
+								refreshScheduled = true
+								task.defer(processBatchedRefreshes)
+							end
+						end
+						
+						-- Initial application (not batched)
+						local ok, now = pcall(function() return inst[prop] end)
+						if ok then
 							local new = mapper(now, inst)
 							if new ~= nil and not sameValue(now, new) then
 								remember(inst, prop, now)
 								pcall(function() inst[prop] = new end)
 							end
 						end
-						refresh()
+						
+						-- Set up change signal with batching
 						local ok, sig = pcall(function() return inst:GetPropertyChangedSignal(prop) end)
 						if ok and sig then
 							keepConn(inst, sig:Connect(refresh))
