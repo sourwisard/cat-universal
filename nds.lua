@@ -3356,7 +3356,7 @@ local function loadHub()
 	----------------------------------------------------------------------
 	-- Debris forcefield: an invisible sphere around you. Any loose (unanchored)
 	-- piece that gets inside it is pushed away from you. Pieces are claimed the
-	-- same way as in Super Ring Parts (huge simulation radius + replication focus),
+	-- same way as in Super Ring Parts (simulation radius 1000 + replication focus),
 	-- so the push actually sticks. Characters and humanoid models are never touched.
 	-- While a piece is inside the sphere it doesn't collide, so it can't hit you on
 	-- the way out; its collision is restored as soon as it leaves (or when switched off).
@@ -3406,9 +3406,10 @@ local function loadHub()
 		local function claimParts()
 			pcall(function()
 				if type(sethiddenproperty) == "function" then
-					sethiddenproperty(LocalPlayer, "SimulationRadius", math.huge)
+					sethiddenproperty(LocalPlayer, "SimulationRadius", 1000)
+					pcall(sethiddenproperty, LocalPlayer, "MaxSimulationRadius", 1000)
 				end
-				LocalPlayer.MaximumSimulationRadius = math.huge
+				LocalPlayer.MaximumSimulationRadius = 1000
 			end)
 		end
 
@@ -5652,6 +5653,396 @@ local function loadHub()
 			end,
 		})
 		misc:AddLabel("Like fling but without the spinning: walk into someone to fling them. Uses noclip too, and turns off when you die.")
+
+		------------------------------------------------------------------
+		-- Heart: builds a heart out of loose (unanchored) parts at
+		-- (0, 250, 0). Parts are claimed the same way as the debris forcefield
+		-- (simulation radius 1000, math.huge doesn't stick + replication focus) so your client owns them,
+		-- and every frame each part is steered to its spot on the outline, with the
+		-- whole heart slowly turning and bobbing, so it is never still and keeps
+		-- its network ownership. The parts are non-solid while in the heart; that,
+		-- and their collision, is put back when the toggle goes off.
+		-- Character parts, anchored parts and big / welded-together pieces are skipped.
+		------------------------------------------------------------------
+		do
+			local HEART_CENTER = Vector3.new(0, 250, 0)
+			local ROT_SPEED = 0.6 -- rad/s the heart turns around the Y axis
+			local BOB = 4 -- studs up / down
+			local PULL = 12 -- velocity per stud of error
+			local MAX_VEL = 250 -- studs/s ceiling for the steering
+			local TELEPORT_DIST = 60 -- farther than this from its spot: jump straight there
+			local MAX_PIECE_PARTS = 8 -- skip assemblies bigger than this
+			local MAX_PIECE_SIZE = 30 -- studs; skip huge pieces
+			local PICK_EVERY = 1.5 -- seconds between searches for more parts
+			local SIM_RADIUS = 1000 -- the simulation radius to claim parts with
+			local partSpin = 500 -- rad/s each part spins on its own axes (keeps ownership); set by the Part spin slider
+
+			local heartOn = false
+			local heartConn = nil
+			local heartCount = 100 -- parts in use right now (auto: follows what is available; manual: the slider)
+			local autoCount = true -- true: part count follows how many owned parts are available
+			local manualCount = 100 -- the Heart parts slider, used when autoCount is off
+			local AUTO_MAX = 1250 -- ceiling for the automatic part count
+			local heartScale = 4
+			local slots = {} -- [i] = { asm = part, parts = {...} }
+			local changed = {} -- [part] = original CanCollide
+			local layout = {} -- [i] = Vector3 point on the heart (unscaled)
+			local lastPick = 0
+			local origFocus, haveFocus = nil, false
+
+			local hasOwnerCheck = type(isnetworkowner) == "function"
+			local function owns(part)
+				if not hasOwnerCheck then
+					return true
+				end
+				local ok, res = pcall(isnetworkowner, part)
+				return not ok or res
+			end
+
+			local overlap = OverlapParams.new()
+			overlap.FilterType = Enum.RaycastFilterType.Exclude
+
+			local function claim()
+				pcall(function()
+					if type(sethiddenproperty) == "function" then
+						sethiddenproperty(LocalPlayer, "SimulationRadius", SIM_RADIUS)
+						pcall(sethiddenproperty, LocalPlayer, "MaxSimulationRadius", SIM_RADIUS)
+					end
+					LocalPlayer.MaximumSimulationRadius = SIM_RADIUS
+				end)
+			end
+
+			-- classic heart curve, t in [0, 2pi)
+			local function heartPoint(t)
+				local x = 16 * math.sin(t) ^ 3
+				local y = 13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t)
+				return x, y
+			end
+
+			-- concentric heart outlines, outermost first. More parts means more rings
+			-- (one per ~50 parts, 2 to 25), each ring getting parts in proportion to its
+			-- size, so a big count makes a full, evenly filled heart.
+			local function buildLayout()
+				table.clear(layout)
+				if heartCount < 1 then
+					return
+				end
+				local rings = math.clamp(math.ceil(heartCount / 50), 2, 25)
+				local scales, total = {}, 0
+				for r = 1, rings do
+					scales[r] = 1 - (r - 1) * (0.75 / rings) -- 1.0 down to about 0.3-0.6
+					total += scales[r]
+				end
+				local left = heartCount
+				for r = 1, rings do
+					local n = (r == rings) and left or math.max(1, math.floor(heartCount * scales[r] / total + 0.5))
+					n = math.min(n, left)
+					left -= n
+					-- offset every other ring by half a step so parts don't line up in spokes
+					local phase = (r % 2 == 0) and 0.5 or 0
+					for i = 0, n - 1 do
+						local x, y = heartPoint(2 * math.pi * (i + phase) / n)
+						table.insert(layout, Vector3.new(x * scales[r], y * scales[r] + 2.5, 0))
+					end
+				end
+			end
+
+			local function releaseSlot(i)
+				local slot = slots[i]
+				slots[i] = nil
+				if slot then
+					for _, part in ipairs(slot.parts) do
+						local orig = changed[part]
+						changed[part] = nil
+						if orig ~= nil and part.Parent then
+							part.CanCollide = orig
+						end
+					end
+				end
+			end
+
+			-- takes a piece for slot i: all its connected parts go non-solid
+			local function claimPiece(i, asm)
+				local ok, list = pcall(asm.GetConnectedParts, asm, true)
+				list = ok and list or { asm }
+				if #list > MAX_PIECE_PARTS then
+					return false
+				end
+				for _, part in ipairs(list) do
+					if changed[part] == nil then
+						changed[part] = part.CanCollide
+					end
+					part.CanCollide = false
+				end
+				slots[i] = { asm = asm, parts = list }
+				return true
+			end
+
+			-- loose pieces your client owns (anywhere in the map) that the heart isn't
+			-- using yet, nearest first. Only owned pieces are ever returned.
+			local function gatherCandidates()
+				local used = {}
+				for _, slot in pairs(slots) do
+					used[slot.asm] = true
+				end
+				local char = LocalPlayer.Character
+				local root = char and char:FindFirstChild("HumanoidRootPart")
+				local from = root and root.Position or HEART_CENTER
+				local cand, seen = {}, {}
+				local exclude = {}
+				for _, plr in ipairs(Players:GetPlayers()) do
+					if plr.Character then
+						table.insert(exclude, plr.Character)
+					end
+				end
+				overlap.FilterDescendantsInstances = exclude
+				-- no distance cutoff: any loose part anywhere that your client owns can be used,
+				-- including ones outside the simulation radius that you still own
+				for _, d in ipairs(workspace:GetDescendants()) do
+					if d:IsA("BasePart") and not d.Anchored then
+						local asm = d.AssemblyRootPart
+						if asm and not seen[asm] and not used[asm] and not asm.Anchored then
+							seen[asm] = true
+							if asm.Size.Magnitude <= MAX_PIECE_SIZE then
+								local model = asm:FindFirstAncestorOfClass("Model")
+								if not (model and model:FindFirstChildOfClass("Humanoid")) then
+									if owns(asm) then
+										table.insert(cand, { asm = asm, dist = (asm.Position - from).Magnitude })
+									end
+								end
+							end
+						end
+					end
+				end
+				table.sort(cand, function(a, b)
+					return a.dist < b.dist
+				end)
+				return cand
+			end
+
+			-- squeezes the pieces in use together at slots 1..n (no holes)
+			local function compactSlots()
+				local maxI = 0
+				for i in pairs(slots) do
+					maxI = math.max(maxI, i)
+				end
+				local list = {}
+				for i = 1, maxI do
+					if slots[i] then
+						table.insert(list, slots[i])
+					end
+				end
+				for i = 1, maxI do
+					slots[i] = list[i]
+				end
+				return #list
+			end
+
+			local function pick()
+				if autoCount then
+					-- automatic: use every owned piece that is available (up to AUTO_MAX); the
+					-- heart's part count and layout follow however many that turns out to be
+					local filled = compactSlots()
+					local cand = gatherCandidates()
+					for _, c in ipairs(cand) do
+						if filled >= AUTO_MAX then
+							break
+						end
+						if claimPiece(filled + 1, c.asm) then
+							filled += 1
+						end
+					end
+					if filled ~= heartCount then
+						heartCount = filled
+						buildLayout()
+					end
+					return
+				end
+
+				-- manual: fill the empty slots of the fixed-size heart
+				local missing = 0
+				for i = 1, heartCount do
+					if not slots[i] then
+						missing += 1
+					end
+				end
+				if missing == 0 then
+					return
+				end
+				local cand = gatherCandidates()
+				local ci = 1
+				for i = 1, heartCount do
+					if not slots[i] then
+						while cand[ci] do
+							local asm = cand[ci].asm
+							ci += 1
+							if claimPiece(i, asm) then
+								break
+							end
+						end
+						if not cand[ci] and not slots[i] then
+							break -- nothing left to use
+						end
+					end
+				end
+			end
+
+			local function step()
+				claim()
+				local now = os.clock()
+
+				-- drop pieces that vanished, got anchored, or are no longer owned by you
+				local needPick = autoCount -- automatic mode keeps looking for newly available parts
+				for i = 1, heartCount do
+					local slot = slots[i]
+					if slot then
+						local asm = slot.asm
+						if not asm.Parent or asm.Anchored or not owns(asm) then
+							releaseSlot(i)
+						end
+					end
+					if not slots[i] then
+						needPick = true
+					end
+				end
+				if needPick and now - lastPick >= PICK_EVERY then
+					lastPick = now
+					pcall(pick)
+				end
+
+				-- steer every piece to its spot; the heart turns and bobs so nothing is ever still
+				local rot = CFrame.Angles(0, now * ROT_SPEED, 0)
+				local center = HEART_CENTER + Vector3.new(0, math.sin(now * 1.5) * BOB, 0)
+				for i = 1, heartCount do
+					local slot = slots[i]
+					local lp = layout[i]
+					if slot and lp then
+						local asm = slot.asm
+						local target = center + rot:VectorToWorldSpace(lp * heartScale)
+						local diff = target - asm.Position
+						if diff.Magnitude > TELEPORT_DIST then
+							asm.CFrame = CFrame.new(target)
+							asm.AssemblyLinearVelocity = Vector3.zero
+						else
+							local v = diff * PULL
+							if v.Magnitude > MAX_VEL then
+								v = v.Unit * MAX_VEL
+							end
+							asm.AssemblyLinearVelocity = v
+						end
+						-- fast spin on the part's own axes (this is the part rotating, not the heart)
+						asm.AssemblyAngularVelocity = Vector3.new(partSpin * 0.6, partSpin, partSpin * 0.8)
+					end
+				end
+			end
+
+			local function setHeart(on)
+				if on == heartOn then
+					return
+				end
+				heartOn = on
+				if heartConn then
+					heartConn:Disconnect()
+					heartConn = nil
+				end
+				if on then
+					heartCount = autoCount and 0 or manualCount
+					buildLayout()
+					lastPick = 0
+					pcall(function()
+						origFocus = LocalPlayer.ReplicationFocus
+						haveFocus = true
+						LocalPlayer.ReplicationFocus = workspace
+					end)
+					local okSig, preSim = pcall(function()
+						return RunService.PreSimulation
+					end)
+					heartConn = (okSig and preSim or RunService.Stepped):Connect(step)
+				else
+					for i in pairs(slots) do
+						local slot = slots[i]
+						if slot and slot.asm.Parent then
+							slot.asm.AssemblyLinearVelocity = Vector3.zero
+							slot.asm.AssemblyAngularVelocity = Vector3.zero
+						end
+						releaseSlot(i)
+					end
+					for part, orig in pairs(changed) do
+						if part.Parent then
+							part.CanCollide = orig
+						end
+					end
+					table.clear(changed)
+					if haveFocus then
+						pcall(function()
+							LocalPlayer.ReplicationFocus = origFocus
+						end)
+						haveFocus = false
+					end
+				end
+			end
+
+			-- changing the size or part count rebuilds the heart; surplus parts are let go
+			local function rebuild()
+				buildLayout()
+				for i in pairs(slots) do
+					if i > heartCount then
+						releaseSlot(i)
+					end
+				end
+				lastPick = 0
+			end
+
+			window.Gui.Destroying:Connect(function()
+				setHeart(false)
+			end)
+
+			misc:AddSection("Heart")
+			misc:AddToggle({
+				Text = "Network heart",
+				Default = false,
+				Callback = setHeart,
+			})
+			misc:AddToggle({
+				Text = "Auto part count",
+				Default = true,
+				Callback = function(on)
+					autoCount = on
+					if heartOn then
+						if not on then
+							heartCount = manualCount
+						end
+						rebuild()
+					end
+				end,
+			})
+			misc:AddSlider({
+				Text = "Heart parts (manual)",
+				Min = 10, Max = 1250, Default = 100, Step = 10, Suffix = " parts",
+				Callback = function(v)
+					manualCount = v
+					if heartOn and not autoCount then
+						heartCount = v
+						rebuild()
+					end
+				end,
+			})
+			misc:AddSlider({
+				Text = "Heart size",
+				Min = 1, Max = 10, Default = 4, Step = 0.5, Suffix = "x",
+				Callback = function(v)
+					heartScale = v
+				end,
+			})
+			misc:AddSlider({
+				Text = "Part spin speed",
+				Min = 0, Max = 10000, Default = 500, Step = 50, Suffix = " rad/s",
+				Callback = function(v)
+					partSpin = v
+				end,
+			})
+			misc:AddLabel("Builds a slowly turning heart out of loose parts at (0, 250, 0). The parts are claimed with a simulation radius of 1000, steered every frame, and each part spins fast on its own axes so your client keeps ownership; they are non-solid while in the heart. With Auto part count on, the heart uses every owned loose part it can find (up to 1250, even ones outside the simulation radius) and resizes itself as parts come and go; turn it off to use the Heart parts slider instead. Needs unanchored parts on the map (e.g. during a disaster) and only ever uses parts your client already owns; a part is let go the moment it stops being yours. Collision is restored when you switch it off.")
+		end
 
 		------------------------------------------------------------------
 		-- Rejoin (same method as Infinite Yield's "rejoin" command):
