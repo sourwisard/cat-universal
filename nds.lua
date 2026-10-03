@@ -3360,6 +3360,8 @@ local function loadHub()
 	-- so the push actually sticks. Characters and humanoid models are never touched.
 	-- While a piece is inside the sphere it doesn't collide, so it can't hit you on
 	-- the way out; its collision is restored as soon as it leaves (or when switched off).
+	-- Separately, ANY loose piece anywhere in the map that moves faster than the
+	-- Noclip speed is made non-solid too, however far away it is (no pushing out there).
 	----------------------------------------------------------------------
 	do
 		local LocalPlayer = Players.LocalPlayer
@@ -3374,7 +3376,7 @@ local function loadHub()
 		local RETAIN_NUDGE = 0.002 -- studs/s, far too small to move anything; just keeps ownership
 		local LOOKAHEAD = 0.12 -- seconds; pieces heading at you are treated as this much closer
 		local nudgeSign = 1
-		local HIGH_VEL = 15 -- studs/s; only pieces moving at least this fast lose collision (any speed during an earthquake); set by the Noclip speed slider
+		local HIGH_VEL = 15 -- studs/s; any piece (near or far) moving at least this fast loses collision (inside the sphere: any speed during an earthquake); set by the Noclip speed slider
 		local HIGH_VEL_EXIT = HIGH_VEL / 2 -- once non-solid, a piece stays non-solid until it slows below this (stops flicker at the threshold)
 		local fastAsm = {} -- [assembly root] = true while it is non-solid because of its speed
 		local changed = {} -- [part] = original CanCollide
@@ -3425,9 +3427,89 @@ local function loadHub()
 			return not ok or res
 		end
 
+		-- every part of the piece stops colliding, not just the ones in range
+		local function noclipAsm(asm, nowFast, insideAsm, insideParts)
+			nowFast[asm] = true
+			insideAsm[asm] = true
+			local c = asmCache[asm]
+			if c == nil or frame - c.frame >= 20 then
+				local ok, list = pcall(asm.GetConnectedParts, asm, true)
+				c = { parts = ok and list or { asm }, frame = frame }
+				asmCache[asm] = c
+			else
+				c.frame = frame -- keep it fresh
+			end
+			for _, p in ipairs(c.parts) do
+				if changed[p] == nil then
+					changed[p] = p.CanCollide
+				end
+				if p.CanCollide then
+					p.CanCollide = false
+				end
+				insideParts[p] = true
+			end
+		end
+
+		-- Map-wide list of loose (unanchored) parts, so fast pieces are found no matter
+		-- how far away they are. Kept up to date by DescendantAdded, plus a full rescan
+		-- every few seconds (spread over several frames) for parts that get unanchored.
+		local freeSet = {}
+		local freeConn = nil
+		local scanQueue, scanIdx = nil, 1
+		local lastScan = 0
+		local SCAN_EVERY = 3 -- seconds between full rescans
+		local SCAN_CHUNK = 2000 -- instances examined per frame during a rescan
+
+		local function considerPart(d)
+			if d:IsA("BasePart") and not d.Anchored then
+				freeSet[d] = true
+			end
+		end
+
+		-- is this piece part of a character / humanoid model? (cached for a second)
+		local badCache = setmetatable({}, { __mode = "k" })
+		local function isCharacterAsm(asm)
+			local now = os.clock()
+			local e = badCache[asm]
+			if e and now - e.t < 1 then
+				return e.bad
+			end
+			local bad = false
+			local model = asm:FindFirstAncestorOfClass("Model")
+			if model and model:FindFirstChildOfClass("Humanoid") then
+				bad = true
+			else
+				for _, ch in ipairs(excludeCache) do
+					if asm:IsDescendantOf(ch) then
+						bad = true
+						break
+					end
+				end
+			end
+			badCache[asm] = { bad = bad, t = now }
+			return bad
+		end
+
 		local function step()
 			claimParts()
 			frame = frame + 1
+
+			-- keep the map-wide loose-part list fresh (chunked so it never hitches)
+			if not scanQueue and os.clock() - lastScan >= SCAN_EVERY then
+				scanQueue = workspace:GetDescendants()
+				scanIdx = 1
+			end
+			if scanQueue then
+				local last = math.min(scanIdx + SCAN_CHUNK - 1, #scanQueue)
+				for i = scanIdx, last do
+					considerPart(scanQueue[i])
+				end
+				scanIdx = last + 1
+				if scanIdx > #scanQueue then
+					scanQueue = nil
+					lastScan = os.clock()
+				end
+			end
 
 			local char = LocalPlayer.Character
 			local root = char and char:FindFirstChild("HumanoidRootPart")
@@ -3517,27 +3599,7 @@ local function loadHub()
 							-- inside the sphere is non-solid, as the shaking makes speed unreliable.
 							local limit = fastAsm[asm] and HIGH_VEL_EXIT or HIGH_VEL
 							if quake or vel.Magnitude >= limit then
-								nowFast[asm] = true
-								insideAsm[asm] = true
-
-								-- every part of the piece stops colliding, not just the ones in range
-								local c = asmCache[asm]
-								if c == nil or frame - c.frame >= 20 then
-									local ok, list = pcall(asm.GetConnectedParts, asm, true)
-									c = { parts = ok and list or { asm }, frame = frame }
-									asmCache[asm] = c
-								else
-									c.frame = frame -- keep it fresh
-								end
-								for _, p in ipairs(c.parts) do
-									if changed[p] == nil then
-										changed[p] = p.CanCollide
-									end
-									if p.CanCollide then
-										p.CanCollide = false
-									end
-									insideParts[p] = true
-								end
+								noclipAsm(asm, nowFast, insideAsm, insideParts)
 							end
 
 							-- one push for the whole piece, only if we simulate it (otherwise it
@@ -3558,6 +3620,27 @@ local function loadHub()
 							-- outside the sphere: leave it alone physically, just keep it claimed
 							if owns(asm) then
 								asm.AssemblyLinearVelocity = vel + nudge
+							end
+						end
+					end
+				end
+
+				-- 3) map-wide: any other loose piece, however far away, that is moving faster
+				-- than the Noclip speed also stops colliding (no pushing, just non-solid).
+				-- Characters, your own assembly and the one under your feet are skipped.
+				local checked = {}
+				for part in pairs(freeSet) do
+					if not part.Parent or part.Anchored then
+						freeSet[part] = nil
+					else
+						local asm = part.AssemblyRootPart
+						if asm and not checked[asm] then
+							checked[asm] = true
+							if not insideAsm[asm] and not asm.Anchored and asm ~= myAssembly and asm ~= floorAssembly and not isCharacterAsm(asm) then
+								local limit = fastAsm[asm] and HIGH_VEL_EXIT or HIGH_VEL
+								if asm.AssemblyLinearVelocity.Magnitude >= limit then
+									noclipAsm(asm, nowFast, insideAsm, insideParts)
+								end
 							end
 						end
 					end
@@ -3594,12 +3677,22 @@ local function loadHub()
 					haveOrigFocus = true
 					LocalPlayer.ReplicationFocus = workspace
 				end)
+				table.clear(freeSet)
+				scanQueue = nil
+				lastScan = 0 -- full scan starts on the first step
+				freeConn = workspace.DescendantAdded:Connect(considerPart)
 				-- PreSimulation runs BEFORE the physics step, so the push applies this frame, not the next
 				local okSig, preSim = pcall(function()
 					return RunService.PreSimulation
 				end)
 				shieldConn = (okSig and preSim or RunService.Stepped):Connect(step)
 			else
+				if freeConn then
+					freeConn:Disconnect()
+					freeConn = nil
+				end
+				table.clear(freeSet)
+				scanQueue = nil
 				for part in pairs(changed) do
 					restoreCollide(part)
 				end
@@ -3652,7 +3745,7 @@ local function loadHub()
 				HIGH_VEL_EXIT = v / 2
 			end,
 		})
-		disasters:AddLabel("Invisible sphere that pushes debris away from you. Pieces you don't own are made non-solid once they move faster than the Noclip speed (slower ones stay solid so they can't sink through the floor). Press X to toggle. Not part of Chillax mode.")
+		disasters:AddLabel("Invisible sphere that pushes debris away from you. Any loose piece, inside the radius or anywhere else on the map, is made non-solid once it moves faster than the Noclip speed (slower ones stay solid so they can't sink through the floor). Only pieces inside the radius are pushed away. Press X to toggle. Not part of Chillax mode.")
 	end
 
 	----------------------------------------------------------------------
@@ -3983,7 +4076,7 @@ local function loadHub()
 	----------------------------------------------------------------------
 	-- Virus immune: while on, every TouchInterest inside
 	-- workspace.Structure.VirusParticles is destroyed (new particles too) and the
-	-- parts get CanTouch = false as a backup, so
+	-- parts get CanTouch = false as a backup and are coloured dark blue, so
 	-- touching a virus particle can't register on your client. The folder only
 	-- exists during the virus disaster, so it is watched for and picked up
 	-- when it appears. Removed TouchInterests are not restored when you turn
@@ -3995,6 +4088,8 @@ local function loadHub()
 		local folderConn = nil
 
 		-- the instance Dex shows as "TouchInterest" has the class TouchTransmitter
+		local NULLIFIED_COLOR = Color3.fromRGB(0, 30, 130) -- dark blue
+
 		local function isTouch(x)
 			return x.ClassName == "TouchTransmitter" or x.ClassName == "TouchInterest"
 		end
@@ -4034,6 +4129,7 @@ local function loadHub()
 			if part and part:IsA("BasePart") then
 				pcall(function()
 					part.CanTouch = false
+					part.Color = NULLIFIED_COLOR
 				end)
 			end
 			pcall(function()
@@ -4049,6 +4145,7 @@ local function loadHub()
 		local function stripPart(part)
 			pcall(function()
 				part.CanTouch = false
+				part.Color = NULLIFIED_COLOR
 			end)
 			for _, ti in ipairs(findTouch(part)) do
 				killTouch(ti)
@@ -4098,6 +4195,7 @@ local function loadHub()
 				elseif d:IsA("BasePart") then
 					pcall(function()
 						d.CanTouch = false
+						d.Color = NULLIFIED_COLOR
 					end)
 					-- the TouchInterest can arrive just after its part
 					task.defer(function()
@@ -4145,7 +4243,7 @@ local function loadHub()
 			Default = false,
 			Callback = setVirusImmune,
 		})
-		disasters:AddLabel("Removes every TouchInterest from the particles in workspace.Structure.VirusParticles (including ones that spawn later) so the virus can't touch you. Switches on with Chillax mode.")
+		disasters:AddLabel("Removes every TouchInterest from the particles in workspace.Structure.VirusParticles (including ones that spawn later) so the virus can't touch you, and turns them dark blue once nullified. Switches on with Chillax mode.")
 	end
 
 	----------------------------------------------------------------------
