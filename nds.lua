@@ -2688,30 +2688,102 @@ local function loadHub()
 			setNoFall(on)
 		end,
 	})
-	-- Anti fling (from Infinite Yield): turns off collision on every other
-	-- player's character so they can't fling you by touching you
-	local antiFlingConn = nil
+	-- Anti fling (from Infinite Yield, made faster): turns off collision on
+	-- every other player's character so they can't fling you by touching you.
+	-- Parts are tracked live (DescendantAdded) instead of re-scanned from a
+	-- cache that could be stale, the check runs every Heartbeat, and a full
+	-- rescan of every character happens every few seconds in case someone
+	-- switches avatars or something slips past the live tracking.
+	local antiFlingConns = {}
 	local antiFlingChanged = setmetatable({}, { __mode = "k" })
+	local antiFlingTracked = {} -- [player] = { parts = {[part]=true}, conns = {} }
+	local ANTI_FLING_RESCAN_EVERY = 3 -- seconds between full rescans
+	local antiFlingLastScan = 0
+	local function afKill(part)
+		if part.CanCollide then
+			antiFlingChanged[part] = true
+			part.CanCollide = false
+		end
+	end
+	local function afUntrack(plr)
+		local t = antiFlingTracked[plr]
+		if t then
+			for _, c in ipairs(t.conns) do
+				c:Disconnect()
+			end
+			antiFlingTracked[plr] = nil
+		end
+	end
+	local function afTrackCharacter(plr, char)
+		afUntrack(plr)
+		if not char then
+			return
+		end
+		local t = { parts = {}, conns = {} }
+		antiFlingTracked[plr] = t
+		local function add(d)
+			if d:IsA("BasePart") then
+				t.parts[d] = true
+				afKill(d) -- instantly, no waiting for the next frame
+			end
+		end
+		for _, d in ipairs(char:GetDescendants()) do
+			add(d)
+		end
+		table.insert(t.conns, char.DescendantAdded:Connect(add))
+		table.insert(t.conns, char.DescendantRemoving:Connect(function(d)
+			t.parts[d] = nil
+		end))
+	end
+	local function afSweep()
+		-- periodic full rescan: catches avatar switches and anything missed
+		local now = os.clock()
+		if now - antiFlingLastScan >= ANTI_FLING_RESCAN_EVERY then
+			antiFlingLastScan = now
+			for _, plr in ipairs(Players:GetPlayers()) do
+				if plr ~= Players.LocalPlayer and plr.Character then
+					afTrackCharacter(plr, plr.Character)
+				end
+			end
+		end
+		for _, t in pairs(antiFlingTracked) do
+			for part in pairs(t.parts) do
+				if part.Parent then
+					if part.CanCollide then
+						antiFlingChanged[part] = true
+						part.CanCollide = false
+					end
+				else
+					t.parts[part] = nil
+				end
+			end
+		end
+	end
 	local function setAntiFling(on)
-		if antiFlingConn then
-			antiFlingConn:Disconnect()
-			antiFlingConn = nil
+		for _, c in ipairs(antiFlingConns) do
+			c:Disconnect()
+		end
+		table.clear(antiFlingConns)
+		for plr in pairs(antiFlingTracked) do
+			afUntrack(plr)
 		end
 		if on then
-			antiFlingConn = RunService.Stepped:Connect(function()
-				for _, plr in ipairs(FrameCache:GetPlayers()) do
-					if plr ~= Players.LocalPlayer and plr.Character then
-						-- Use cached character parts instead of GetDescendants every step
-						local parts = FrameCache:GetCharacterParts(plr.Character, 20)
-						for _, v in ipairs(parts) do
-							if v.CanCollide then
-								antiFlingChanged[v] = true
-								v.CanCollide = false
-							end
-						end
-					end
+			local function hookPlayer(plr)
+				if plr == Players.LocalPlayer then
+					return
 				end
-			end)
+				afTrackCharacter(plr, plr.Character)
+				table.insert(antiFlingConns, plr.CharacterAdded:Connect(function(char)
+					afTrackCharacter(plr, char)
+				end))
+			end
+			for _, plr in ipairs(Players:GetPlayers()) do
+				hookPlayer(plr)
+			end
+			table.insert(antiFlingConns, Players.PlayerAdded:Connect(hookPlayer))
+			table.insert(antiFlingConns, Players.PlayerRemoving:Connect(afUntrack))
+			antiFlingLastScan = os.clock()
+			table.insert(antiFlingConns, RunService.Heartbeat:Connect(afSweep))
 		else
 			-- put back only the parts we turned off
 			for part in pairs(antiFlingChanged) do
