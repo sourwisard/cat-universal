@@ -1467,6 +1467,7 @@ local function loadHub()
 		Sprint = Enum.KeyCode.R,
 		SavePlayer = Enum.KeyCode.T,
 		Fling = Enum.KeyCode.Z,
+		AimbotToggle = Enum.KeyCode.C,
 		Forward = Enum.KeyCode.W,
 		Back = Enum.KeyCode.S,
 		Left = Enum.KeyCode.A,
@@ -2914,8 +2915,9 @@ local function loadHub()
 	}
 	local ESP_COLOR_NAMES = { "Red", "Green", "Blue", "Purple", "Yellow", "Cyan", "White" }
 
-	-- saved ESP settings (the master "ESP enabled" switch always starts off)
+	-- saved ESP settings, including whether ESP was switched on
 	applySaved(espCfg, Saved.ESP, {
+		Enabled = { bool = true },
 		Boxes = { bool = true },
 		Names = { bool = true },
 		Health = { bool = true },
@@ -2927,10 +2929,8 @@ local function loadHub()
 	})
 	local function setESP(key, value)
 		espCfg[key] = value
-		if key ~= "Enabled" then
-			Saved.ESP[key] = value
-			queueSave()
-		end
+		Saved.ESP[key] = value
+		queueSave()
 	end
 	local BLACK = Color3.new(0, 0, 0)
 
@@ -3243,15 +3243,15 @@ local function loadHub()
 	----------------------------------------------------------------------
 	-- Aimbot tab: turns your camera toward the nearest player inside the FOV circle.
 	-- It only moves your own camera; nothing is sent to the game.
-	-- Settings are saved to the same file as the keybinds (the aimbot itself always
-	-- starts switched off).
+	-- Settings, and whether it was on, are saved to the same file as the keybinds.
+	-- Press C (rebindable in Settings > Keybinds) to switch it on or off.
 	----------------------------------------------------------------------
 	do
 		local me = Players.LocalPlayer
 		local BIND_NAME = "CatsHubAimbot"
 
 		local aim = {
-			Enabled = false,
+			Enabled = false, -- restored from the save file below
 			Activation = IsOnMobile and "Always on" or "Hold right-click",
 			Part = "Head",
 			AimFrom = "Cursor", -- "Cursor" (screen centre when the mouse is locked) or "Screen center"
@@ -3267,6 +3267,7 @@ local function loadHub()
 
 		-- what each saved value is allowed to be; anything else in the file is ignored
 		local SPEC = {
+			Enabled = { bool = true },
 			Activation = { options = { "Hold right-click", "Always on" } },
 			Part = { options = { "Head", "Torso", "HumanoidRootPart" } },
 			AimFrom = { options = { "Cursor", "Screen center" } },
@@ -3422,27 +3423,14 @@ local function loadHub()
 				return
 			end
 
-			-- Turn the camera so the target ends up exactly under the aim point (the cursor, or
-			-- the screen centre). Turning the screen centre onto the target instead would drag it
-			-- out of a cursor-based circle, and the lock would drop after a moment.
 			local targetPos = part.Position + part.AssemblyLinearVelocity * (aim.Predict / 1000)
-			local want = targetPos - camPos
-			if want.Magnitude < 1e-3 then
-				return
-			end
-			want = want.Unit
-			local ray = cam:ViewportPointToRay(center.X, center.Y)
-			local axis = ray.Direction:Cross(want)
-			if axis.Magnitude < 1e-5 then
-				return -- already dead on
-			end
-			local angle = math.acos(math.clamp(ray.Direction:Dot(want), -1, 1))
 			local alpha = 1 - (aim.Smooth / 100) ^ (dt * 60) -- same feel at any frame rate
-			cam.CFrame = CFrame.new(camPos) * CFrame.fromAxisAngle(axis.Unit, angle * alpha) * (cam.CFrame - camPos)
+			cam.CFrame = cam.CFrame:Lerp(CFrame.lookAt(camPos, targetPos), alpha)
 		end
 
+		-- switches the aimbot on or off without touching the save file
 		local bound = false
-		local function setAimbot(on)
+		local function applyAimbot(on)
 			aim.Enabled = on
 			if on and not bound then
 				bound = true
@@ -3455,20 +3443,48 @@ local function loadHub()
 			end
 		end
 
+		-- what the toggle and the hotkey call: switch it and remember the choice
+		local function setAimbot(on)
+			applyAimbot(on)
+			Saved.Aimbot.Enabled = on
+			queueSave()
+		end
+
+		local aimToggle -- created below; the hotkey flips it
+
+		-- hotkey (C by default, change it in Settings > Keybinds)
+		local aimKeyConn = UserInputService.InputBegan:Connect(function(input, processed)
+			if processed or window._listening then
+				return
+			end
+			if Keys.AimbotToggle and input.KeyCode == Keys.AimbotToggle and aimToggle then
+				aimToggle:Set(not aimToggle:Get())
+				window:Notify({
+					Title = "Aimbot",
+					Text = aimToggle:Get() and "On" or "Off",
+					Duration = 1.5,
+				})
+			end
+		end)
+
 		window.Gui.Destroying:Connect(function()
-			setAimbot(false)
+			applyAimbot(false) -- only stops it; the saved on/off choice is left alone
 			beganConn:Disconnect()
 			endedConn:Disconnect()
+			aimKeyConn:Disconnect()
 			circle:Destroy()
 		end)
 
 		local aimTab = window:AddTab("Aimbot")
 		aimTab:AddSection("Aimbot")
-		aimTab:AddToggle({
+		aimToggle = aimTab:AddToggle({
 			Text = "Enable aimbot",
-			Default = false,
+			Default = aim.Enabled,
 			Callback = setAimbot,
 		})
+		if aim.Enabled then
+			applyAimbot(true) -- it was on last time
+		end
 		aimTab:AddDropdown({
 			Text = "Activation",
 			Options = SPEC.Activation.options,
@@ -5116,6 +5132,14 @@ end
 		end,
 	})
 	settings:AddKeybind({
+		Text = "Toggle aimbot",
+		Default = Keys.AimbotToggle,
+		Callback = function(k)
+			Keys.AimbotToggle = k
+			saveKeys()
+		end,
+	})
+	settings:AddKeybind({
 		Text = "Fly forward",
 		Default = Keys.Forward,
 		Callback = function(k)
@@ -5185,9 +5209,9 @@ end
 		docs:AddSection("Fly")
 		docs:AddLabel("Flies where you look · keys can be changed in Settings  (Infinite Yield)")
 		docs:AddSection("Saved settings")
-		docs:AddLabel("Aimbot and ESP settings (and your keybinds) are saved to cats_universal_hub_keybinds.json in your executor's workspace folder and come back next time. The Aimbot and ESP enabled switches always start off.")
+		docs:AddLabel("Aimbot and ESP settings (and your keybinds) are saved to cats_universal_hub_keybinds.json in your executor's workspace folder and come back next time. This includes whether ESP and the aimbot were switched on.")
 		docs:AddSection("Aimbot")
-		docs:AddLabel("Turns your camera toward the player closest to the aim point inside the FOV circle. Hold right-click to aim on PC, or set Activation to Always on. Aim from: Cursor uses the mouse (the screen centre when the mouse is locked or on touch), Screen center always uses the middle of the screen. Stick to target keeps the same player until they leave the circle. Team check skips teammates, wall check only picks players you can see, higher smoothness turns more slowly, and prediction leads moving targets. It only moves your own camera. Your settings are saved and come back next time, but the aimbot always starts off.")
+		docs:AddLabel("Turns your camera toward the player closest to the aim point inside the FOV circle. Hold right-click to aim on PC, or set Activation to Always on. Aim from: Cursor uses the mouse (the screen centre when the mouse is locked or on touch), Screen center always uses the middle of the screen. Stick to target keeps the same player until they leave the circle. Team check skips teammates, wall check only picks players you can see, higher smoothness turns more slowly, and prediction leads moving targets. It only moves your own camera. Press C to switch it on or off (change the key in Settings > Keybinds). Your settings, and whether it was on, are saved and come back next time.")
 		docs:AddSection("Gloomy night")
 		docs:AddLabel("Warm dusky night: soft orange haze, a glowing amber moon, stars and gentle color grading. Also hides clouds, and overrides No fog. Turning it off restores the map's lighting.")
 		docs:AddSection("Shooting stars")
