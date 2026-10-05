@@ -2914,8 +2914,9 @@ local function loadHub()
 	}
 	local ESP_COLOR_NAMES = { "Red", "Green", "Blue", "Purple", "Yellow", "Cyan", "White" }
 
-	-- saved ESP settings (the master "ESP enabled" switch always starts off)
+	-- saved ESP settings (including whether ESP was switched on)
 	applySaved(espCfg, Saved.ESP, {
+		Enabled = { bool = true },
 		Boxes = { bool = true },
 		Names = { bool = true },
 		Health = { bool = true },
@@ -2927,10 +2928,8 @@ local function loadHub()
 	})
 	local function setESP(key, value)
 		espCfg[key] = value
-		if key ~= "Enabled" then
-			Saved.ESP[key] = value
-			queueSave()
-		end
+		Saved.ESP[key] = value
+		queueSave()
 	end
 	local BLACK = Color3.new(0, 0, 0)
 
@@ -3243,8 +3242,7 @@ local function loadHub()
 	----------------------------------------------------------------------
 	-- Aimbot tab: moves your mouse toward the nearest player inside the FOV circle (the way most
 	-- aimbots do it), so the game's own camera does the turning. It never writes the camera.
-	-- Settings are saved to the same file as the keybinds (the aimbot itself always
-	-- starts switched off).
+	-- Settings (including whether it was on) are saved to the same file as the keybinds.
 	----------------------------------------------------------------------
 	do
 		local me = Players.LocalPlayer
@@ -3279,6 +3277,7 @@ local function loadHub()
 			Predict = { min = 0, max = 300 },
 			InvertX = { bool = true },
 			InvertY = { bool = true },
+			Enabled = { bool = true },
 			ShowFov = { bool = true },
 			TeamCheck = { bool = true },
 			WallCheck = { bool = true },
@@ -3945,9 +3944,16 @@ local function loadHub()
 		aimTab:AddSection("Aimbot")
 		aimTab:AddToggle({
 			Text = "Enable aimbot",
-			Default = false,
-			Callback = setAimbot,
+			Default = aim.Enabled, -- restored from the save file
+			Callback = function(on)
+				setAimbot(on)
+				Saved.Aimbot.Enabled = on -- only the toggle saves this (closing the hub calls setAimbot(false) too)
+				queueSave()
+			end,
 		})
+		if aim.Enabled then
+			setAimbot(true) -- was on last time: start it again
+		end
 		aimTab:AddDropdown({
 			Text = "Activation",
 			Options = SPEC.Activation.options,
@@ -5695,9 +5701,9 @@ end
 		docs:AddSection("Fly")
 		docs:AddLabel("Flies where you look · keys can be changed in Settings  (Infinite Yield)")
 		docs:AddSection("Saved settings")
-		docs:AddLabel("Aimbot and ESP settings (and your keybinds) are saved to cats_universal_hub_keybinds.json in your executor's workspace folder and come back next time. The Aimbot and ESP enabled switches always start off.")
+		docs:AddLabel("Aimbot and ESP settings (and your keybinds) are saved to cats_universal_hub_keybinds.json in your executor's workspace folder and come back next time. Whether the Aimbot and ESP switches were on is saved too, so they come back on next time.")
 		docs:AddSection("Aimbot")
-		docs:AddLabel("Moves your mouse toward the closest player (in studs) inside the FOV circle, and prefers players you can actually hit: if the closest one is behind a wall but another can be hit, it aims at the one that can be hit; if nobody can be hit it aims at the closest. Wall check off treats everyone as hittable, so it's just the closest. Hold right-click to aim on PC, or set Activation to Always on. Aim from: Cursor uses the mouse (the screen centre when the mouse is locked or on touch), Screen center always uses the middle of the screen. Stick to target keeps the same player until someone else is clearly better (hittable, or much closer). Team check skips teammates, higher smoothness turns more slowly, and prediction leads moving targets. Your settings are saved and come back next time, but the aimbot always starts off. The aimbot is mouse-only (it never writes the camera): with Aim from set to Screen center the mouse has to be locked (hold right-click or shift-lock), otherwise use Aim from: Cursor. Needs an executor with mousemoverel. It also checks whether each push really brings the target closer and flips a reversed axis by itself within about a second; Invert horizontal / vertical are a manual override.")
+		docs:AddLabel("Moves your mouse toward the closest player (in studs) inside the FOV circle, and prefers players you can actually hit: if the closest one is behind a wall but another can be hit, it aims at the one that can be hit; if nobody can be hit it aims at the closest. Wall check off treats everyone as hittable, so it's just the closest. Hold right-click to aim on PC, or set Activation to Always on. Aim from: Cursor uses the mouse (the screen centre when the mouse is locked or on touch), Screen center always uses the middle of the screen. Stick to target keeps the same player until someone else is clearly better (hittable, or much closer). Team check skips teammates, higher smoothness turns more slowly, and prediction leads moving targets. Your settings are saved and come back next time, including whether it was on. The aimbot is mouse-only (it never writes the camera): with Aim from set to Screen center the mouse has to be locked (hold right-click or shift-lock), otherwise use Aim from: Cursor. Needs an executor with mousemoverel. It also checks whether each push really brings the target closer and flips a reversed axis by itself within about a second; Invert horizontal / vertical are a manual override.")
 		docs:AddSection("Gloomy night")
 		docs:AddLabel("Warm dusky night: soft orange haze, a glowing amber moon, stars and gentle color grading. Also hides clouds, and overrides No fog. Turning it off restores the map's lighting.")
 		docs:AddSection("Shooting stars")
