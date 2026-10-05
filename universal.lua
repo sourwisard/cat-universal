@@ -1467,7 +1467,6 @@ local function loadHub()
 		Sprint = Enum.KeyCode.R,
 		SavePlayer = Enum.KeyCode.T,
 		Fling = Enum.KeyCode.Z,
-		AimbotToggle = Enum.KeyCode.C,
 		Forward = Enum.KeyCode.W,
 		Back = Enum.KeyCode.S,
 		Left = Enum.KeyCode.A,
@@ -2915,9 +2914,8 @@ local function loadHub()
 	}
 	local ESP_COLOR_NAMES = { "Red", "Green", "Blue", "Purple", "Yellow", "Cyan", "White" }
 
-	-- saved ESP settings, including whether ESP was switched on
+	-- saved ESP settings (the master "ESP enabled" switch always starts off)
 	applySaved(espCfg, Saved.ESP, {
-		Enabled = { bool = true },
 		Boxes = { bool = true },
 		Names = { bool = true },
 		Health = { bool = true },
@@ -2929,8 +2927,10 @@ local function loadHub()
 	})
 	local function setESP(key, value)
 		espCfg[key] = value
-		Saved.ESP[key] = value
-		queueSave()
+		if key ~= "Enabled" then
+			Saved.ESP[key] = value
+			queueSave()
+		end
 	end
 	local BLACK = Color3.new(0, 0, 0)
 
@@ -3241,17 +3241,17 @@ local function loadHub()
 	end
 
 	----------------------------------------------------------------------
-	-- Aimbot tab: turns your camera toward the nearest player inside the FOV circle.
-	-- It only moves your own camera; nothing is sent to the game.
-	-- Settings, and whether it was on, are saved to the same file as the keybinds.
-	-- Press C (rebindable in Settings > Keybinds) to switch it on or off.
+	-- Aimbot tab: moves your mouse toward the nearest player inside the FOV circle (the way most
+	-- aimbots do it), so the game's own camera does the turning. It never writes the camera.
+	-- Settings are saved to the same file as the keybinds (the aimbot itself always
+	-- starts switched off).
 	----------------------------------------------------------------------
 	do
 		local me = Players.LocalPlayer
 		local BIND_NAME = "CatsHubAimbot"
 
 		local aim = {
-			Enabled = false, -- restored from the save file below
+			Enabled = false,
 			Activation = IsOnMobile and "Always on" or "Hold right-click",
 			Part = "Head",
 			AimFrom = "Cursor", -- "Cursor" (screen centre when the mouse is locked) or "Screen center"
@@ -3263,11 +3263,13 @@ local function loadHub()
 			Sticky = true, -- keep the same target until it leaves the circle
 			Smooth = 75, -- percent; higher = slower, softer turn (0 = snap instantly)
 			Predict = 0, -- milliseconds of target movement to lead by
+			InvertX = false, -- flip the horizontal / vertical push if the aim goes AWAY from the target
+			InvertY = false,
+			Method = "Mouse", -- fixed: the aimbot only moves the mouse (the game's own camera does the turning)
 		}
 
 		-- what each saved value is allowed to be; anything else in the file is ignored
 		local SPEC = {
-			Enabled = { bool = true },
 			Activation = { options = { "Hold right-click", "Always on" } },
 			Part = { options = { "Head", "Torso", "HumanoidRootPart" } },
 			AimFrom = { options = { "Cursor", "Screen center" } },
@@ -3275,6 +3277,8 @@ local function loadHub()
 			MaxDistance = { min = 50, max = 2000 },
 			Smooth = { min = 0, max = 95 },
 			Predict = { min = 0, max = 300 },
+			InvertX = { bool = true },
+			InvertY = { bool = true },
 			ShowFov = { bool = true },
 			TeamCheck = { bool = true },
 			WallCheck = { bool = true },
@@ -3290,14 +3294,186 @@ local function loadHub()
 
 		local holding = false
 		local lockedPlr = nil
+		local nextPick = 0 -- next time the locked target is compared against the other players
+		-- anti-jitter state
+		local aimPart, aimPos = nil, nil -- target part + its low-pass filtered position
+		local lastSeen = {} -- [player] = last time they were visible (wall-check hysteresis)
+		local TARGET_RATE = 30 -- 1/s; how tightly the filtered aim point follows the target
+		local WALL_GRACE = 0.25 -- seconds a target may flicker "hidden" before the lock drops
+		local DEADZONE = math.rad(0.12) -- don't chase errors smaller than this
+		-- Your own mouse movement beats the aimbot: the pull fades out as you move the mouse
+		-- (px per frame, only measurable while the mouse is locked: right-drag / shift-lock)
+		-- and a hard flick away also drops the current lock.
+		local YIELD_START, YIELD_FULL = 2, 12
+
+		-- Debug log (Aimbot tab > Debug). Prints to the console (F9 / executor console) and, if
+		-- the executor allows it, saves the same text to workspace/cats_hub_aimbot_log.txt.
+		local LOG_FILE = "cats_hub_aimbot_log.txt"
+		local dbg = { on = false, lines = {}, t0 = 0, lastSummary = 0, lastFlush = 0 }
+		local function newStats()
+			return {
+				frames = 0, dtSum = 0, dtMax = 0, -- every rendered frame while logging
+				aimFrames = 0, -- frames the aimbot was actually steering
+				errSum = 0, errMax = 0, grew = 0, dead = 0, -- aim error before each correction (deg)
+				appliedSum = 0, -- degrees we turned the camera
+				extSum = 0, extMax = 0, extFrames = 0, -- camera movement NOT done by us, between our frames (deg)
+				rawFrames = 0, rawStepSum = 0, rawStepMax = 0, rawStill = 0, -- target part movement per frame
+				lagSum = 0, -- distance between raw and filtered aim point
+				graceSaves = 0, switches = 0,
+				viaMouse = 0, viaCamera = 0, mouseFallback = 0, sentSum = 0, shiftSum = 0, shiftN = 0, -- how we steered
+				mouseSum = 0, yielded = 0, -- your mouse movement vs the aim pull
+				overChecks = 0, overCount = 0, overSum = 0, reasserted = 0, -- camera overwritten after we wrote it
+			}
+		end
+		local S = newStats()
+		local loggedPlr, lastLook, lastRaw, prevErr, idleLogged = nil, nil, nil, nil, false
+		-- Games with their own camera script can write Camera.CFrame after us, which makes the
+		-- aimbot "hit" (the shot reads our rotation) while the screen doesn't move. So the step
+		-- runs after everything else, and a re-assert hook puts our CFrame back if something
+		-- still wrote over it later in the same render step.
+		local AFTER_EVERYTHING = Enum.RenderPriority.Last.Value + 100
+		local pendingCF = nil -- CFrame written this frame, waiting for the re-assert check
+		-- mouse-movement method (works when the game's camera ignores / overwrites Camera.CFrame)
+		local autoMouse, overScore, autoFrames, warnedNoMouse, warnedUnlocked = false, 0, 0, false, false
+		local gain = Vector2.new(3, 3) -- how many screen px the view shifts per mouse px (learned live)
+		local sentMouse, carry = Vector2.zero, Vector2.zero -- px sent last frame / fractional remainder
+		-- learns only the SIZE of the gain; the direction is the watchdog's job (below)
+		local function learnGain(cur, g)
+			g = math.abs(g)
+			if g <= 0.2 or g >= 30 then
+				return cur
+			end
+			return cur + (g - cur) * 0.5
+		end
+		-- did the last push on this axis bring the target closer to the aim point? Four more
+		-- "went the wrong way" than "right way" in a row = the axis is reversed. Crossing over to
+		-- the other side of the aim point doesn't count as wrong (that's just overshoot).
+		local function judgeAxis(sentA, s0, s1, score)
+			local e0, e1 = math.abs(s0), math.abs(s1)
+			if math.abs(sentA) < 2 or e0 < 10 then
+				return score, false
+			end
+			if s0 * s1 > 0 and e1 > e0 + 1 then
+				score -= 1
+			elseif e1 < e0 - 1 then
+				score = math.min(score + 1, 3)
+			end
+			if score <= -4 then
+				return 0, true
+			end
+			return score, false
+		end
+		local prevWorld, prevScreen, prevCenter = nil, nil, nil
+		-- direction watchdog: +1 / -1 per axis. Starts normal and flips by itself if the corrections
+		-- we send make the target drift AWAY from the aim point (reversed mouse / camera)
+		local flipX, flipY, scoreX, scoreY = 1, 1, 0, 0
+		local function resetMouseState()
+			sentMouse, carry, prevWorld, prevScreen, prevCenter = Vector2.zero, Vector2.zero, nil, nil, nil
+		end
+		local lastFinal = nil -- same, for the post-render diagnostic
+
+		local function log(fmt, ...)
+			if not dbg.on then
+				return
+			end
+			local line = string.format("[AimLog %7.2f] " .. fmt, os.clock() - dbg.t0, ...)
+			print(line)
+			table.insert(dbg.lines, line)
+			if #dbg.lines > 4000 then
+				dbg.lines = table.move(dbg.lines, 1001, #dbg.lines, 1, {})
+			end
+		end
+
+		local function flush()
+			if type(writefile) == "function" then
+				pcall(writefile, LOG_FILE, table.concat(dbg.lines, "\n"))
+			end
+		end
+
+		local function dbgHeader()
+			local cam = workspace.CurrentCamera
+			local exec = "unknown"
+			if type(identifyexecutor) == "function" then
+				local ok, name = pcall(identifyexecutor)
+				exec = ok and tostring(name) or exec
+			end
+			log("=== aimbot debug log (anti-jitter build) ===")
+			log("game %s | place %s | executor %s | %s", tostring(game.GameId), tostring(game.PlaceId), exec, IsOnMobile and "mobile" or "desktop")
+			log("settings: Activation=%s Part=%s AimFrom=%s FOV=%s Smooth=%s Predict=%s", aim.Activation, aim.Part, aim.AimFrom, tostring(aim.FOV), tostring(aim.Smooth), tostring(aim.Predict))
+			log("mousemoverel available: %s", tostring(type(mousemoverel) == "function"))
+			log("settings: Sticky=%s Team=%s Wall=%s MaxDist=%s Enabled=%s", tostring(aim.Sticky), tostring(aim.TeamCheck), tostring(aim.WallCheck), tostring(aim.MaxDistance), tostring(aim.Enabled))
+			log("constants: TARGET_RATE=%s WALL_GRACE=%s DEADZONE=%.2f deg", tostring(TARGET_RATE), tostring(WALL_GRACE), math.deg(DEADZONE))
+			if cam then
+				log("camera: type=%s subject=%s fov=%.0f viewport=%dx%d", tostring(cam.CameraType), tostring(cam.CameraSubject and cam.CameraSubject.ClassName), cam.FieldOfView, cam.ViewportSize.X, cam.ViewportSize.Y)
+			end
+		end
+
+		local function dbgTick(dt, cam)
+			S.frames += 1
+			S.dtSum += dt
+			S.dtMax = math.max(S.dtMax, dt)
+			local now = os.clock()
+			local elapsed = now - dbg.lastSummary
+			if elapsed < 1 then
+				return
+			end
+			dbg.lastSummary = now
+			if S.aimFrames > 0 then
+				idleLogged = false
+				local n = S.aimFrames
+				log("%.0f fps | frame avg %.1f ms, max %.1f ms | steering on %d frames", S.frames / elapsed, S.dtSum / S.frames * 1000, S.dtMax * 1000, n)
+				log("  aim error avg %.2f deg, max %.2f deg | error GREW on %d frames (%.0f%%) | deadzone frames %d", S.errSum / n, S.errMax, S.grew, S.grew / n * 100, S.dead)
+				log("  we turned the camera avg %.3f deg/frame | camera moved by something else avg %.3f, max %.2f deg/frame", S.appliedSum / n, S.extFrames > 0 and S.extSum / S.extFrames or 0, S.extMax)
+				log("  target part moved avg %.3f, max %.2f studs/frame | identical to last frame on %.0f%% of frames | filter lag avg %.2f studs", S.rawFrames > 0 and S.rawStepSum / S.rawFrames or 0, S.rawStepMax, S.rawFrames > 0 and S.rawStill / S.rawFrames * 100 or 0, S.lagSum / n)
+				log("  your mouse moved avg %.1f px/frame | aim pull was reduced by your input on %d frames", S.mouseSum / n, S.yielded)
+				if S.overChecks > 0 then
+					log("  camera was CHANGED by something else after we set it on %d/%d frames (avg %.2f deg) | we re-applied it %d times", S.overCount, S.overChecks, S.overCount > 0 and S.overSum / S.overCount or 0, S.reasserted)
+				end
+				log("  steered via: mouse %d frames, camera %d frames, mouse-not-possible %d | mouse sent avg %.1f px/frame, view shifted avg %.1f px/frame (%d samples) | mouse locked=%s", S.viaMouse, S.viaCamera, S.mouseFallback, S.viaMouse > 0 and S.sentSum / S.viaMouse or 0, S.shiftN > 0 and S.shiftSum / S.shiftN or 0, S.shiftN, tostring(UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default))
+				log("  method=%s%s | mouse gain est (%.2f, %.2f) | overwrite score %.2f", aim.Method, (aim.Method == "Auto" and autoMouse) and " -> MOUSE" or "", gain.X, gain.Y, overScore)
+				log("  wall-grace saves %d | target switches %d | camType=%s zoom=%.1f mouse=%s holding=%s", S.graceSaves, S.switches, tostring(cam.CameraType), (cam.CFrame.Position - cam.Focus.Position).Magnitude, tostring(UserInputService.MouseBehavior), tostring(holding))
+			elseif not idleLogged then
+				idleLogged = true
+				log("idle: not steering (activation=%s holding=%s mouse=%s)", aim.Activation, tostring(holding), tostring(UserInputService.MouseBehavior))
+			end
+			S = newStats()
+			if now - dbg.lastFlush > 10 then
+				dbg.lastFlush = now
+				flush()
+			end
+		end
+
+		local function setDebug(on)
+			if on == dbg.on then
+				return
+			end
+			if on then
+				dbg.lines = {}
+				dbg.t0 = os.clock()
+				dbg.lastSummary, dbg.lastFlush = dbg.t0, dbg.t0
+				S = newStats()
+				loggedPlr, lastLook, lastRaw, prevErr, idleLogged = nil, nil, nil, nil, false
+				dbg.on = true
+				dbgHeader()
+				if not aim.Enabled then
+					log("note: the aimbot itself is switched off - enable it, then aim at someone")
+				end
+			else
+				log("debug logging stopped")
+				dbg.on = false
+				flush()
+			end
+		end
 		local beganConn = UserInputService.InputBegan:Connect(function(input)
 			if input.UserInputType == Enum.UserInputType.MouseButton2 then
 				holding = true
+				log("right mouse DOWN (mouse=%s)", tostring(UserInputService.MouseBehavior))
 			end
 		end)
 		local endedConn = UserInputService.InputEnded:Connect(function(input)
 			if input.UserInputType == Enum.UserInputType.MouseButton2 then
 				holding = false
+				log("right mouse UP")
 			end
 		end)
 
@@ -3352,52 +3528,166 @@ local function loadHub()
 			return workspace:Raycast(origin, part.Position - origin, rayParams) == nil
 		end
 
-		-- the target part for this player if they can be aimed at, plus how far it is
-		-- from the aim point in pixels (nil when they can't be)
+		-- the target part for this player if they can be aimed at, how far it is from the aim
+		-- point in pixels, whether it can actually be hit (nothing in the way) and its distance
+		-- in studs. nil + a reason when they can't be aimed at at all
 		local function evaluate(plr, cam, camPos, center, fovLimit)
 			local char = plr.Character
 			local hum = char and char:FindFirstChildOfClass("Humanoid")
 			if not hum or hum.Health <= 0 then
-				return nil
+				return nil, "dead / no character"
 			end
 			if aim.TeamCheck and me.Team ~= nil and plr.Team == me.Team then
-				return nil
+				return nil, "teammate"
 			end
 			local part = targetPart(char)
-			if not part or (part.Position - camPos).Magnitude > aim.MaxDistance then
-				return nil
+			if not part then
+				return nil, "no target part"
+			end
+			local dist = (part.Position - camPos).Magnitude
+			if dist > aim.MaxDistance then
+				return nil, "too far"
 			end
 			local pos, onScreen = cam:WorldToViewportPoint(part.Position)
 			if not onScreen then
-				return nil
+				return nil, "off screen"
 			end
 			local d = (Vector2.new(pos.X, pos.Y) - center).Magnitude
 			if d > fovLimit then
-				return nil
+				return nil, dbg.on and string.format("outside FOV (%.0f px > %.0f px)", d, fovLimit) or "outside FOV"
 			end
-			if aim.WallCheck and not canSee(camPos, part, char) then
-				return nil
+			local hittable = true
+			if aim.WallCheck then
+				-- thin parts / accessories make the ray flicker blocked-unblocked every frame,
+				-- which dropped and re-grabbed the lock (a big source of jitter), so a target
+				-- only counts as hidden after it has been blocked for a short moment
+				local now = os.clock()
+				if canSee(camPos, part, char) then
+					lastSeen[plr] = now
+				elseif lastSeen[plr] and now - lastSeen[plr] < WALL_GRACE then
+					if dbg.on then
+						S.graceSaves += 1
+					end
+				else
+					hittable = false
+				end
 			end
-			return part, d
+			return part, d, hittable, dist
 		end
 
+		-- Picks among the players inside the FOV circle: anyone who can be hit beats anyone who
+		-- can't; between equals the one closest to you (in studs) wins. So if the closest player
+		-- is behind a wall but another can be hit, the hittable one is chosen; if nobody can be
+		-- hit, the closest one is.
 		local function findTarget(cam, camPos, center)
-			local bestPart, bestPlr, bestDist = nil, nil, math.huge
+			local bestPart, bestPlr, bestHit, bestDist = nil, nil, false, math.huge
 			for _, plr in ipairs(Players:GetPlayers()) do
 				if plr ~= me then
-					local part, d = evaluate(plr, cam, camPos, center, math.min(aim.FOV, bestDist))
-					if part and d < bestDist then
-						bestPart, bestPlr, bestDist = part, plr, d
+					local part, _, hit, dist = evaluate(plr, cam, camPos, center, aim.FOV)
+					if part and ((hit and not bestHit) or (hit == bestHit and dist < bestDist)) then
+						bestPart, bestPlr, bestHit, bestDist = part, plr, hit, dist
 					end
 				end
 			end
-			return bestPart, bestPlr
+			return bestPart, bestPlr, bestHit, bestDist
+		end
+
+		-- Aim by moving the mouse instead of writing the camera. Returns false if it can't be
+		-- used right now (then the aimbot does nothing for that frame).
+		local function mouseAim(cam, center, worldPos, alpha, userMove)
+			local locked = UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default
+			local aimIsCursor = not (aim.AimFrom == "Screen center" or IsOnMobile or UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter)
+			if not locked and not aimIsCursor then
+				return false -- moving the mouse would only move the cursor, not the view
+			end
+			local sp = cam:WorldToViewportPoint(worldPos)
+			if sp.Z <= 0 then
+				return false
+			end
+			local scr = Vector2.new(sp.X, sp.Y)
+
+			-- learn how far the view moves per mouse pixel: look at where the SAME world point
+			-- was last frame vs now, and compare with what we sent (so target movement and your
+			-- own mouse movement don't skew it)
+			if prevWorld and prevScreen and prevCenter and userMove < 2 and (sentMouse.X ~= 0 or sentMouse.Y ~= 0) then
+				local now = cam:WorldToViewportPoint(prevWorld)
+				if now.Z > 0 then
+					local nowScr = Vector2.new(now.X, now.Y)
+					local shift = nowScr - prevScreen
+					local flippedX, flippedY
+					scoreX, flippedX = judgeAxis(sentMouse.X, prevScreen.X - prevCenter.X, nowScr.X - center.X, scoreX)
+					scoreY, flippedY = judgeAxis(sentMouse.Y, prevScreen.Y - prevCenter.Y, nowScr.Y - center.Y, scoreY)
+					if flippedX then
+						flipX = -flipX
+						log("aim was moving away horizontally -> direction flipped (now %s)", flipX > 0 and "normal" or "reversed")
+					end
+					if flippedY then
+						flipY = -flipY
+						log("aim was moving away vertically -> direction flipped (now %s)", flipY > 0 and "normal" or "reversed")
+					end
+					if dbg.on then
+						S.shiftSum += shift.Magnitude
+						S.shiftN += 1
+					end
+					if locked then
+						local gx, gy = gain.X, gain.Y
+						if math.abs(sentMouse.X) >= 2 then
+							gx = learnGain(gx, shift.X / sentMouse.X)
+						end
+						if math.abs(sentMouse.Y) >= 2 then
+							gy = learnGain(gy, shift.Y / sentMouse.Y)
+						end
+						gain = Vector2.new(gx, gy)
+					end
+				end
+			end
+
+			local errVec = scr - center
+			prevWorld, prevScreen, prevCenter = worldPos, scr, center
+			if errVec.Magnitude < 1.5 then
+				sentMouse = Vector2.zero
+				return true
+			end
+			local move = errVec * alpha
+			if locked then
+				local gx = math.abs(gain.X) < 0.3 and (gain.X < 0 and -0.3 or 0.3) or gain.X
+				local gy = math.abs(gain.Y) < 0.3 and (gain.Y < 0 and -0.3 or 0.3) or gain.Y
+				move = Vector2.new(move.X / gx, move.Y / gy)
+			end
+			move = Vector2.new(move.X * flipX, move.Y * flipY)
+			if aim.InvertX then
+				move = Vector2.new(-move.X, move.Y)
+			end
+			if aim.InvertY then
+				move = Vector2.new(move.X, -move.Y)
+			end
+			if move.Magnitude > 80 then
+				move = move.Unit * 80
+			end
+			local total = move + carry
+			local ix, iy = math.round(total.X), math.round(total.Y)
+			carry = total - Vector2.new(ix, iy)
+			sentMouse = Vector2.new(ix, iy)
+			if ix ~= 0 or iy ~= 0 then
+				local ok, err = pcall(mousemoverel, ix, iy)
+				if not ok and not warnedNoMouse then
+					warnedNoMouse = true
+					log("mousemoverel ERROR: %s", tostring(err))
+				end
+			end
+			if dbg.on then
+				S.sentSum += sentMouse.Magnitude
+			end
+			return true
 		end
 
 		local function step(dt)
 			local cam = workspace.CurrentCamera
 			if not cam then
 				return
+			end
+			if dbg.on then
+				dbgTick(dt, cam)
 			end
 			local center = aimPoint(cam)
 			circle.Visible = aim.ShowFov
@@ -3406,85 +3696,258 @@ local function loadHub()
 
 			if aim.Activation ~= "Always on" and not holding then
 				lockedPlr = nil
+				aimPart, aimPos, lastLook, lastRaw, prevErr = nil, nil, nil, nil, nil
+				resetMouseState()
 				return
 			end
 
 			local camPos = cam.CFrame.Position
-			local part
+			local part, lostWhy, lockedHit, lockedDist
 			-- keep the current target while it stays reasonably close to the circle,
 			-- so the aim doesn't flick between players as the camera moves
 			if aim.Sticky and lockedPlr and lockedPlr.Parent then
-				part = evaluate(lockedPlr, cam, camPos, center, aim.FOV * 1.5)
+				part, lostWhy, lockedHit, lockedDist = evaluate(lockedPlr, cam, camPos, center, aim.FOV * 1.5)
+				-- ...but a few times a second check whether someone else is now the better pick:
+				-- somebody hittable while the current one isn't, or (same hittable state) clearly closer
+				local clockNow = os.clock()
+				if part and clockNow >= nextPick then
+					nextPick = clockNow + 0.1
+					local bp, bpl, bhit, bdist = findTarget(cam, camPos, center)
+					if bpl and bpl ~= lockedPlr and ((bhit and not lockedHit) or (bhit == lockedHit and bdist < lockedDist * 0.8)) then
+						log("switching %s -> %s (%s)", lockedPlr.Name, bpl.Name, (bhit and not lockedHit) and "the other one can be hit" or "closer")
+						part, lockedPlr = bp, bpl
+						aimPart, aimPos, lastRaw, prevErr = nil, nil, nil, nil
+					end
+				end
 			end
 			if not part then
+				local prev = lockedPlr
 				part, lockedPlr = findTarget(cam, camPos, center)
+				if dbg.on and prev and lockedPlr ~= prev then
+					log("lost %s: %s", prev.Name, type(lostWhy) == "string" and lostWhy or "left the player list / sticky off")
+				end
+			end
+			if dbg.on and lockedPlr ~= loggedPlr then
+				if lockedPlr and part then
+					S.switches += 1
+					log("target -> %s (%s) %.0f studs away", lockedPlr.Name, part.Name, (part.Position - camPos).Magnitude)
+				else
+					log("target -> none (nobody visible inside the FOV circle)")
+				end
+				loggedPlr = lockedPlr
 			end
 			if not part then
+				aimPart, aimPos, lastLook, lastRaw, prevErr = nil, nil, nil, nil, nil
+				resetMouseState()
 				return
 			end
 
-			local targetPos = part.Position + part.AssemblyLinearVelocity * (aim.Predict / 1000)
+			dt = math.min(dt, 0.1) -- a long frame must not cause a lurch
+
+			-- Parts only move on physics steps (~60 Hz) but the camera runs every rendered frame,
+			-- so aiming at the raw position stair-steps. Low-pass the aim point instead; the
+			-- same filter also smooths animation bob on heads and noisy velocity for Predict.
+			local rawPos = part.Position + part.AssemblyLinearVelocity * (aim.Predict / 1000)
+			if aimPart ~= part or not aimPos then
+				aimPart, aimPos = part, rawPos
+				lastRaw, prevErr = nil, nil
+			else
+				aimPos = aimPos:Lerp(rawPos, 1 - math.exp(-TARGET_RATE * dt))
+			end
+
+			if dbg.on then
+				S.aimFrames += 1
+				if lastRaw then
+					local stepLen = (rawPos - lastRaw).Magnitude
+					S.rawFrames += 1
+					S.rawStepSum += stepLen
+					S.rawStepMax = math.max(S.rawStepMax, stepLen)
+					if stepLen < 1e-4 then
+						S.rawStill += 1
+					end
+				end
+				lastRaw = rawPos
+				S.lagSum += (rawPos - aimPos).Magnitude
+				if lastLook then
+					-- how far the camera moved since we last set it (mouse input, the game's camera
+					-- script, character movement...). Large values while you aren't touching the
+					-- mouse mean something else is fighting the aimbot.
+					local look0 = cam.CFrame.LookVector
+					local ext = math.deg(math.atan2(look0:Cross(lastLook).Magnitude, look0:Dot(lastLook)))
+					S.extSum += ext
+					S.extFrames += 1
+					S.extMax = math.max(S.extMax, ext)
+				end
+			end
+
+			local want = aimPos - camPos
+			if want.Magnitude < 1e-3 then
+				return
+			end
+			want = want.Unit
+			local ray = cam:ViewportPointToRay(center.X, center.Y)
+			local axis = ray.Direction:Cross(want)
+			if axis.Magnitude < 1e-5 then
+				return -- dead on (or exactly behind us, where there is no sensible turn axis)
+			end
+			-- atan2 instead of acos: acos is very inaccurate for tiny angles, which made the
+			-- camera shake when it was almost on target
+			local angle = math.atan2(axis.Magnitude, ray.Direction:Dot(want))
+			if dbg.on then
+				local deg = math.deg(angle)
+				S.errSum += deg
+				S.errMax = math.max(S.errMax, deg)
+				if prevErr and deg > prevErr + 0.05 then
+					S.grew += 1
+				end
+				prevErr = deg
+			end
+			if angle < DEADZONE then
+				if dbg.on then
+					S.dead += 1
+				end
+				lastLook = cam.CFrame.LookVector
+				return -- already on target
+			end
 			local alpha = 1 - (aim.Smooth / 100) ^ (dt * 60) -- same feel at any frame rate
-			cam.CFrame = cam.CFrame:Lerp(CFrame.lookAt(camPos, targetPos), alpha)
+
+			-- let the player take the camera back: the more the mouse moves, the less we pull
+			-- (mouse movement we injected ourselves is subtracted so it isn't mistaken for yours)
+			local md = UserInputService:GetMouseDelta()
+			-- sign-agnostic: whatever we injected shows up as roughly |sentMouse| of delta (even if the
+			-- executor scales or reverses it), so only the excess counts as the player's own movement
+			local mouseMove = math.max(0, md.Magnitude - sentMouse.Magnitude * 1.5)
+			if mouseMove > YIELD_START then
+				local yield = math.clamp((mouseMove - YIELD_START) / (YIELD_FULL - YIELD_START), 0, 1)
+				alpha *= 1 - yield
+				if mouseMove >= YIELD_FULL then
+					lockedPlr = nil -- a hard flick away: don't stay glued to the old target
+				end
+				if dbg.on then
+					S.yielded += 1
+				end
+			end
+			if dbg.on then
+				S.mouseSum += mouseMove
+				S.appliedSum += math.deg(angle * alpha)
+			end
+
+			if type(mousemoverel) ~= "function" then
+				-- mouse-only aimbot: without mousemoverel there is nothing to steer with
+				if not warnedNoMouse then
+					warnedNoMouse = true
+					log("this executor has no mousemoverel, so the aimbot can't move the mouse")
+					window:Notify({ Title = "Aimbot", Text = "Your executor has no mousemoverel, so the aimbot can't work.", Duration = 5 })
+				end
+				sentMouse = Vector2.zero
+				return
+			end
+			if mouseAim(cam, center, aimPos, alpha, mouseMove) then
+				if dbg.on then
+					S.viaMouse += 1
+				end
+				return
+			end
+			-- the mouse can't steer the view right now (cursor unlocked + "Screen center"): leave the
+			-- camera alone and tell the user once
+			sentMouse = Vector2.zero
+			if dbg.on then
+				S.mouseFallback += 1
+			end
+			if not warnedUnlocked then
+				warnedUnlocked = true
+				window:Notify({ Title = "Aimbot", Text = "Mouse-only aimbot: lock the mouse (hold right-click) or set Aim from to Cursor.", Duration = 5 })
+			end
 		end
 
-		-- switches the aimbot on or off without touching the save file
 		local bound = false
-		local function applyAimbot(on)
+		local reassertConn, diagConn = nil, nil
+		local function setAimbot(on)
 			aim.Enabled = on
 			if on and not bound then
 				bound = true
-				RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Camera.Value + 1, step)
+				log("aimbot ON")
+				autoMouse, overScore, autoFrames, warnedNoMouse, warnedUnlocked = false, 0, 0, false, false
+				resetMouseState()
+				-- start of each frame: forget last frame's pending CFrame
+				RunService:BindToRenderStep(BIND_NAME .. "Frame", Enum.RenderPriority.First.Value, function()
+					pendingCF = nil
+				end)
+				RunService:BindToRenderStep(BIND_NAME, AFTER_EVERYTHING, step)
+				-- if the RenderStepped event runs after our step, anything that wrote over us in
+				-- between gets undone (pendingCF is only set when our step already ran this frame)
+				reassertConn = RunService.RenderStepped:Connect(function()
+					local cf = pendingCF
+					if not cf then
+						return
+					end
+					pendingCF = nil
+					local cam = workspace.CurrentCamera
+					if cam and cam.CFrame ~= cf then
+						cam.CFrame = cf
+						if dbg.on then
+							S.reasserted += 1
+						end
+					end
+				end)
+				-- diagnostic: after the frame, is the camera still what we wrote?
+				diagConn = RunService.Heartbeat:Connect(function()
+					local cf = lastFinal
+					lastFinal = nil
+					local cam = workspace.CurrentCamera
+					if not (cf and cam) then
+						return
+					end
+					local a, b = cam.CFrame.LookVector, cf.LookVector
+					local diff = math.deg(math.atan2(a:Cross(b).Magnitude, a:Dot(b)))
+					-- how often does something else change the camera after we set it?
+					overScore = overScore * 0.9 + (diff > 0.3 and 0.1 or 0)
+					autoFrames += 1
+					if dbg.on then
+						S.overChecks += 1
+						if diff > 0.05 then
+							S.overCount += 1
+							S.overSum += diff
+						end
+					end
+				end)
 			elseif not on and bound then
 				bound = false
+				log("aimbot OFF")
 				RunService:UnbindFromRenderStep(BIND_NAME)
+				RunService:UnbindFromRenderStep(BIND_NAME .. "Frame")
+				if reassertConn then
+					reassertConn:Disconnect()
+					reassertConn = nil
+				end
+				if diagConn then
+					diagConn:Disconnect()
+					diagConn = nil
+				end
+				pendingCF, lastFinal = nil, nil
 				circle.Visible = false
-				lockedPlr = nil
+				lockedPlr, loggedPlr = nil, nil
+				aimPart, aimPos, lastLook, lastRaw, prevErr = nil, nil, nil, nil, nil
+				resetMouseState()
+				table.clear(lastSeen)
 			end
 		end
-
-		-- what the toggle and the hotkey call: switch it and remember the choice
-		local function setAimbot(on)
-			applyAimbot(on)
-			Saved.Aimbot.Enabled = on
-			queueSave()
-		end
-
-		local aimToggle -- created below; the hotkey flips it
-
-		-- hotkey (C by default, change it in Settings > Keybinds)
-		local aimKeyConn = UserInputService.InputBegan:Connect(function(input, processed)
-			if processed or window._listening then
-				return
-			end
-			if Keys.AimbotToggle and input.KeyCode == Keys.AimbotToggle and aimToggle then
-				aimToggle:Set(not aimToggle:Get())
-				window:Notify({
-					Title = "Aimbot",
-					Text = aimToggle:Get() and "On" or "Off",
-					Duration = 1.5,
-				})
-			end
-		end)
 
 		window.Gui.Destroying:Connect(function()
-			applyAimbot(false) -- only stops it; the saved on/off choice is left alone
+			setAimbot(false)
+			setDebug(false)
 			beganConn:Disconnect()
 			endedConn:Disconnect()
-			aimKeyConn:Disconnect()
 			circle:Destroy()
 		end)
 
 		local aimTab = window:AddTab("Aimbot")
 		aimTab:AddSection("Aimbot")
-		aimToggle = aimTab:AddToggle({
+		aimTab:AddToggle({
 			Text = "Enable aimbot",
-			Default = aim.Enabled,
+			Default = false,
 			Callback = setAimbot,
 		})
-		if aim.Enabled then
-			applyAimbot(true) -- it was on last time
-		end
 		aimTab:AddDropdown({
 			Text = "Activation",
 			Options = SPEC.Activation.options,
@@ -3499,6 +3962,22 @@ local function loadHub()
 			Default = aim.Part,
 			Callback = function(v)
 				setOpt("Part", v)
+			end,
+		})
+		aimTab:AddToggle({
+			Text = "Invert horizontal (turn on if it aims away)",
+			Default = aim.InvertX,
+			Callback = function(v)
+				setOpt("InvertX", v)
+				resetMouseState()
+			end,
+		})
+		aimTab:AddToggle({
+			Text = "Invert vertical (turn on if it aims away)",
+			Default = aim.InvertY,
+			Callback = function(v)
+				setOpt("InvertY", v)
+				resetMouseState()
 			end,
 		})
 
@@ -3553,7 +4032,7 @@ local function loadHub()
 			end,
 		})
 		aimTab:AddToggle({
-			Text = "Wall check (only visible players)",
+			Text = "Wall check (prefer players you can hit)",
 			Default = aim.WallCheck,
 			Callback = function(on)
 				setOpt("WallCheck", on)
@@ -3575,6 +4054,21 @@ local function loadHub()
 				setOpt("Predict", v)
 			end,
 		})
+
+		aimTab:AddSection("Debug")
+		aimTab:AddToggle({
+			Text = "Print debug log",
+			Default = false,
+			Callback = function(on)
+				setDebug(on)
+				if on then
+					window:Notify({ Title = "Aimbot log", Text = "Logging to the console" .. (type(writefile) == "function" and (" and workspace/" .. LOG_FILE) or "") .. ". Aim at someone for a few seconds.", Duration = 4 })
+				elseif type(writefile) == "function" then
+					window:Notify({ Title = "Aimbot log", Text = "Saved to workspace/" .. LOG_FILE, Duration = 4 })
+				end
+			end,
+		})
+		aimTab:AddLabel("Prints a summary every second while you aim (frame times, aim error, camera movement from other sources, target movement) plus lock/lose events. Not saved between sessions.")
 	end
 
 	----------------------------------------------------------------------
@@ -5132,14 +5626,6 @@ end
 		end,
 	})
 	settings:AddKeybind({
-		Text = "Toggle aimbot",
-		Default = Keys.AimbotToggle,
-		Callback = function(k)
-			Keys.AimbotToggle = k
-			saveKeys()
-		end,
-	})
-	settings:AddKeybind({
 		Text = "Fly forward",
 		Default = Keys.Forward,
 		Callback = function(k)
@@ -5209,9 +5695,9 @@ end
 		docs:AddSection("Fly")
 		docs:AddLabel("Flies where you look · keys can be changed in Settings  (Infinite Yield)")
 		docs:AddSection("Saved settings")
-		docs:AddLabel("Aimbot and ESP settings (and your keybinds) are saved to cats_universal_hub_keybinds.json in your executor's workspace folder and come back next time. This includes whether ESP and the aimbot were switched on.")
+		docs:AddLabel("Aimbot and ESP settings (and your keybinds) are saved to cats_universal_hub_keybinds.json in your executor's workspace folder and come back next time. The Aimbot and ESP enabled switches always start off.")
 		docs:AddSection("Aimbot")
-		docs:AddLabel("Turns your camera toward the player closest to the aim point inside the FOV circle. Hold right-click to aim on PC, or set Activation to Always on. Aim from: Cursor uses the mouse (the screen centre when the mouse is locked or on touch), Screen center always uses the middle of the screen. Stick to target keeps the same player until they leave the circle. Team check skips teammates, wall check only picks players you can see, higher smoothness turns more slowly, and prediction leads moving targets. It only moves your own camera. Press C to switch it on or off (change the key in Settings > Keybinds). Your settings, and whether it was on, are saved and come back next time.")
+		docs:AddLabel("Moves your mouse toward the closest player (in studs) inside the FOV circle, and prefers players you can actually hit: if the closest one is behind a wall but another can be hit, it aims at the one that can be hit; if nobody can be hit it aims at the closest. Wall check off treats everyone as hittable, so it's just the closest. Hold right-click to aim on PC, or set Activation to Always on. Aim from: Cursor uses the mouse (the screen centre when the mouse is locked or on touch), Screen center always uses the middle of the screen. Stick to target keeps the same player until someone else is clearly better (hittable, or much closer). Team check skips teammates, higher smoothness turns more slowly, and prediction leads moving targets. Your settings are saved and come back next time, but the aimbot always starts off. The aimbot is mouse-only (it never writes the camera): with Aim from set to Screen center the mouse has to be locked (hold right-click or shift-lock), otherwise use Aim from: Cursor. Needs an executor with mousemoverel. It also checks whether each push really brings the target closer and flips a reversed axis by itself within about a second; Invert horizontal / vertical are a manual override.")
 		docs:AddSection("Gloomy night")
 		docs:AddLabel("Warm dusky night: soft orange haze, a glowing amber moon, stars and gentle color grading. Also hides clouds, and overrides No fog. Turning it off restores the map's lighting.")
 		docs:AddSection("Shooting stars")
