@@ -1,7 +1,4 @@
-// Presence server: tracks who is playing Natural Disaster Survival right now.
-// Plain Node.js (18+), no packages, and it never talks to Cloudflare.
-// Sessions live in memory; a restart just clears the list and everyone reappears
-// on their next heartbeat (10 seconds).
+
 
 const http = require("http");
 const crypto = require("crypto");
